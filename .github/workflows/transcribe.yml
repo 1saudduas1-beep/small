@@ -12,6 +12,14 @@ on:
         required: false
         default: 'transcript'
         type: string
+      output_format:
+        description: 'Output format'
+        required: false
+        default: 'srt'
+        type: choice
+        options:
+          - srt
+          - txt
 
 jobs:
   transcribe:
@@ -27,10 +35,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install ffmpeg
+      - name: Install ffmpeg and aria2
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg aria2
 
       - name: Install Python dependencies
         run: |
@@ -43,10 +51,25 @@ jobs:
 
       - name: Download audio from extracted direct link
         run: |
-          curl -L --fail --retry 3 \
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
-            "$(cat audio_url.txt)" \
-            -o input_audio.mp4
+          # The captured googlevideo.com URL is signed/IP-locked and time-limited,
+          # so a single-connection curl download was the main bottleneck for
+          # large audio files. aria2c splits the download into parallel
+          # connections against the same URL (the host supports HTTP Range
+          # requests), which cuts download time dramatically while keeping
+          # the same retry/User-Agent behavior.
+          aria2c \
+            --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+            --max-connection-per-server=16 \
+            --split=16 \
+            --min-split-size=1M \
+            --max-tries=3 \
+            --retry-wait=2 \
+            --continue=true \
+            --allow-overwrite=true \
+            --console-log-level=warn \
+            --summary-interval=5 \
+            --out=input_audio.mp4 \
+            "$(cat audio_url.txt)"
 
       - name: Verify download
         run: |
@@ -55,11 +78,11 @@ jobs:
 
       - name: Transcribe with faster-whisper
         run: |
-          python transcribe.py input_audio.mp4 "${{ github.event.inputs.base_name }}.srt"
+          python transcribe.py input_audio.mp4 "${{ github.event.inputs.base_name }}.${{ github.event.inputs.output_format }}" "${{ github.event.inputs.output_format }}"
 
       - name: Upload transcript artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.base_name }}
-          path: ${{ github.event.inputs.base_name }}.srt
+          path: ${{ github.event.inputs.base_name }}.${{ github.event.inputs.output_format }}
           retention-days: 14
