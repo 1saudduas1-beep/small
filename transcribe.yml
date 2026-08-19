@@ -1,0 +1,59 @@
+name: Transcribe Audio
+
+on:
+  workflow_dispatch:
+    inputs:
+      audio_url:
+        description: 'Direct audio URL (NotebookLM Audio Overview)'
+        required: true
+        type: string
+      base_name:
+        description: 'Output file base name (optional)'
+        required: false
+        default: 'transcript'
+        type: string
+
+jobs:
+  transcribe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: pip install faster-whisper
+
+      - name: Download audio from direct link
+        run: |
+          curl -L --fail --retry 3 \
+            -H "User-Agent: Mozilla/5.0" \
+            "${{ github.event.inputs.audio_url }}" \
+            -o input_audio.mp4
+
+      - name: Verify download
+        run: |
+          ls -lh input_audio.mp4
+          ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1 input_audio.mp4
+
+      - name: Transcribe with faster-whisper
+        run: |
+          python transcribe.py input_audio.mp4 "${{ github.event.inputs.base_name }}.srt"
+
+      - name: Upload transcript artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.base_name }}
+          path: ${{ github.event.inputs.base_name }}.srt
+          retention-days: 14
