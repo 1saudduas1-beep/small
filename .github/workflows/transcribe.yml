@@ -20,6 +20,18 @@ on:
         options:
           - srt
           - txt
+      model_size:
+        description: 'Whisper model size'
+        required: false
+        default: 'small'
+        type: choice
+        options:
+          - tiny
+          - base
+          - small
+          - medium
+          - large-v2
+          - large-v3
 
 jobs:
   transcribe:
@@ -44,6 +56,17 @@ jobs:
         run: |
           pip install faster-whisper playwright
           playwright install --with-deps chromium
+
+      - name: Cache Whisper model
+        uses: actions/cache@v4
+        with:
+          # faster-whisper downloads model weights via huggingface_hub,
+          # which stores them here by default. Caching this path avoids
+          # re-downloading the same model on every run.
+          path: ~/.cache/huggingface
+          # Keyed on the selected model size so switching sizes just adds
+          # a new cache entry instead of invalidating the old one.
+          key: hf-whisper-${{ github.event.inputs.model_size }}
 
       - name: Extract direct audio URL from share link
         run: |
@@ -78,7 +101,7 @@ jobs:
 
       - name: Transcribe with faster-whisper
         run: |
-          python transcribe.py input_audio.mp4 "${{ github.event.inputs.base_name }}.${{ github.event.inputs.output_format }}" "${{ github.event.inputs.output_format }}"
+          python transcribe.py input_audio.mp4 "${{ github.event.inputs.base_name }}.${{ github.event.inputs.output_format }}" "${{ github.event.inputs.output_format }}" "${{ github.event.inputs.model_size }}"
 
       - name: Upload transcript artifact
         uses: actions/upload-artifact@v4
