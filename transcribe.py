@@ -1,17 +1,21 @@
 """
-Transcribes an audio file using faster-whisper (model size "small",
-English only) and writes the result as either:
+Transcribes an audio file using faster-whisper (English only) and writes
+the result as either:
   - srt: numbered segments with start/end timestamps
   - txt: numbered segments with the timestamps removed
 
 Usage:
-    python transcribe.py <input_audio_path> <output_path> [format]
+    python transcribe.py <input_audio_path> <output_path> [format] [model_size]
 
-    format: "srt" (default) or "txt"
+    format:     "srt" (default) or "txt"
+    model_size: any faster-whisper model size, e.g. "tiny", "base",
+                "small" (default), "medium", "large-v3"
 """
 
 import sys
 from faster_whisper import WhisperModel
+
+VALID_MODEL_SIZES = {"tiny", "base", "small", "medium", "large-v2", "large-v3"}
 
 
 def format_timestamp(total_seconds: float) -> str:
@@ -61,20 +65,32 @@ WRITERS = {
 
 
 def main():
-    if len(sys.argv) not in (3, 4):
-        print("Usage: python transcribe.py <input_audio_path> <output_path> [srt|txt]")
+    if len(sys.argv) not in (3, 4, 5):
+        print(
+            "Usage: python transcribe.py <input_audio_path> <output_path> "
+            "[srt|txt] [model_size]"
+        )
         sys.exit(1)
 
     input_path = sys.argv[1]
     output_path = sys.argv[2]
-    output_format = sys.argv[3].strip().lower() if len(sys.argv) == 4 else "srt"
+    output_format = sys.argv[3].strip().lower() if len(sys.argv) >= 4 else "srt"
+    model_size = sys.argv[4].strip().lower() if len(sys.argv) == 5 else "small"
 
     if output_format not in WRITERS:
         print(f"ERROR: unsupported format '{output_format}'. Use 'srt' or 'txt'.", file=sys.stderr)
         sys.exit(1)
 
-    print("Loading model 'small' (int8, CPU)...")
-    model = WhisperModel("small", device="cpu", compute_type="int8")
+    if model_size not in VALID_MODEL_SIZES:
+        print(
+            f"ERROR: unsupported model_size '{model_size}'. "
+            f"Choose one of: {', '.join(sorted(VALID_MODEL_SIZES))}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"Loading model '{model_size}' (int8, CPU)...")
+    model = WhisperModel(model_size, device="cpu", compute_type="int8")
 
     print(f"Transcribing '{input_path}' (language=en)...")
     segments, info = model.transcribe(
