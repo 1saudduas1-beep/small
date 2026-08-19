@@ -1,9 +1,13 @@
 """
-Transcribes an audio file into an SRT subtitle file (with per-segment
-timestamps) using faster-whisper, model size "small", English only.
+Transcribes an audio file using faster-whisper (model size "small",
+English only) and writes the result as either:
+  - srt: numbered segments with start/end timestamps
+  - txt: numbered segments with the timestamps removed
 
 Usage:
-    python transcribe.py <input_audio_path> <output_srt_path>
+    python transcribe.py <input_audio_path> <output_path> [format]
+
+    format: "srt" (default) or "txt"
 """
 
 import sys
@@ -24,15 +28,52 @@ def format_timestamp(total_seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
 
+def write_srt(segments, output_path: str) -> int:
+    """Write numbered segments with timestamps (standard .srt)."""
+    count = 0
+    with open(output_path, "w", encoding="utf-8") as f:
+        for i, segment in enumerate(segments, start=1):
+            start = format_timestamp(segment.start)
+            end = format_timestamp(segment.end)
+            text = segment.text.strip()
+            f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
+            print(f"  [{start} --> {end}] {text}")
+            count += 1
+    return count
+
+
+def write_txt(segments, output_path: str) -> int:
+    """Write numbered segments WITHOUT timestamps."""
+    count = 0
+    with open(output_path, "w", encoding="utf-8") as f:
+        for i, segment in enumerate(segments, start=1):
+            text = segment.text.strip()
+            f.write(f"{i}\n{text}\n\n")
+            print(f"  [{i}] {text}")
+            count += 1
+    return count
+
+
+WRITERS = {
+    "srt": write_srt,
+    "txt": write_txt,
+}
+
+
 def main():
-    if len(sys.argv) != 3:
-        print("Usage: python transcribe.py <input_audio_path> <output_srt_path>")
+    if len(sys.argv) not in (3, 4):
+        print("Usage: python transcribe.py <input_audio_path> <output_path> [srt|txt]")
         sys.exit(1)
 
     input_path = sys.argv[1]
     output_path = sys.argv[2]
+    output_format = sys.argv[3].strip().lower() if len(sys.argv) == 4 else "srt"
 
-    print(f"Loading model 'small' (int8, CPU)...")
+    if output_format not in WRITERS:
+        print(f"ERROR: unsupported format '{output_format}'. Use 'srt' or 'txt'.", file=sys.stderr)
+        sys.exit(1)
+
+    print("Loading model 'small' (int8, CPU)...")
     model = WhisperModel("small", device="cpu", compute_type="int8")
 
     print(f"Transcribing '{input_path}' (language=en)...")
@@ -45,17 +86,14 @@ def main():
 
     print(f"Detected duration: {info.duration:.1f}s")
 
-    count = 0
-    with open(output_path, "w", encoding="utf-8") as f:
-        for i, segment in enumerate(segments, start=1):
-            start = format_timestamp(segment.start)
-            end = format_timestamp(segment.end)
-            text = segment.text.strip()
-            f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
-            count += 1
-            print(f"  [{start} --> {end}] {text}")
+    # faster-whisper returns a generator; materialize once so we can
+    # both print progress and hand it to the chosen writer without
+    # re-running transcription.
+    segments = list(segments)
 
-    print(f"Done. Wrote {count} segments to '{output_path}'.")
+    count = WRITERS[output_format](segments, output_path)
+
+    print(f"Done. Wrote {count} segments to '{output_path}' (format={output_format}).")
 
 
 if __name__ == "__main__":
