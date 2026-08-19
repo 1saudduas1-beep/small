@@ -3,8 +3,8 @@ name: Transcribe Audio
 on:
   workflow_dispatch:
     inputs:
-      audio_url:
-        description: 'Direct audio URL (NotebookLM Audio Overview)'
+      share_url:
+        description: 'NotebookLM Audio Overview share link'
         required: true
         type: string
       base_name:
@@ -33,13 +33,19 @@ jobs:
           sudo apt-get install -y ffmpeg
 
       - name: Install Python dependencies
-        run: pip install faster-whisper
+        run: |
+          pip install faster-whisper playwright
+          playwright install --with-deps chromium
 
-      - name: Download audio from direct link
+      - name: Extract direct audio URL from share link
+        run: |
+          python extract_audio_url.py "${{ github.event.inputs.share_url }}" audio_url.txt
+
+      - name: Download audio from extracted direct link
         run: |
           curl -L --fail --retry 3 \
-            -H "User-Agent: Mozilla/5.0" \
-            "${{ github.event.inputs.audio_url }}" \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+            "$(cat audio_url.txt)" \
             -o input_audio.mp4
 
       - name: Verify download
