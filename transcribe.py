@@ -1,8 +1,6 @@
 """
-Transcribes an audio file using faster-whisper (English only) via
-BatchedInferencePipeline (batch_size=8) for faster CPU throughput at the
-same accuracy as standard sequential decoding, and writes the result as
-either:
+Transcribes an audio file using faster-whisper (English only) and writes
+the result as either:
   - srt: numbered segments with start/end timestamps
   - txt: numbered segments with the timestamps removed
 
@@ -11,19 +9,17 @@ Usage:
 
     format:     "srt" (default) or "txt"
     model_size: any faster-whisper model size, e.g. "tiny", "base",
-                "small" (default), "medium", "large-v3"
+                "small" (default), "medium", "large-v2", "large-v3",
+                "distil-large-v3"
 """
 
 import os
 import sys
-from faster_whisper import WhisperModel, BatchedInferencePipeline
+from faster_whisper import WhisperModel
 
-VALID_MODEL_SIZES = {"tiny", "base", "small", "medium", "large-v2", "large-v3"}
-
-# Documented faster-whisper CPU benchmark: batch_size=8 roughly halves
-# wall-clock time versus non-batched inference at the same accuracy
-# (same model weights, just parallelized decoding of VAD-split chunks).
-BATCH_SIZE = 8
+VALID_MODEL_SIZES = {
+    "tiny", "base", "small", "medium", "large-v2", "large-v3", "distil-large-v3",
+}
 
 
 def format_timestamp(total_seconds: float) -> str:
@@ -104,18 +100,12 @@ def main():
     print(f"Loading model '{model_size}' (int8, CPU, cpu_threads={cpu_threads})...")
     model = WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=cpu_threads)
 
-    # BatchedInferencePipeline wraps the same model/weights and parallelizes
-    # decoding of VAD-split chunks instead of processing them sequentially.
-    # Accuracy is unaffected (same weights); only throughput improves.
-    batched_model = BatchedInferencePipeline(model=model)
-
-    print(f"Transcribing '{input_path}' (language=en, batch_size={BATCH_SIZE})...")
-    segments, info = batched_model.transcribe(
+    print(f"Transcribing '{input_path}' (language=en)...")
+    segments, info = model.transcribe(
         input_path,
         language="en",
         beam_size=5,
         vad_filter=True,  # skip silence, useful for AI-generated podcasts
-        batch_size=BATCH_SIZE,
     )
 
     print(f"Detected duration: {info.duration:.1f}s")
