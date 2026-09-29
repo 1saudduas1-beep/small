@@ -6,31 +6,83 @@ Usage:
     python translate_transcript.py <input_path> <output_prefix> [mode] [model]
 
     mode:  "arabic" (default) | "bilingual" | "both"
-    model: Gemini model name (default: gemini-3.8-flash)
+    model: primary Gemini model name (default: gemini-3.8-flash)
+
+Resilience (HTTP 503 / overload):
+    Every request walks a fallback chain: primary model -> FALLBACK_CHAIN.
+    Each model gets a few jittered-backoff retries, then the next model is
+    tried. A model that just failed is skipped for COOLDOWN_SECS so later
+    requests do not waste time on it. If the whole chain fails, a partial
+    file (<prefix>_ar_partial.<ext>) is written and the script exits 1.
+
+Optional env vars:
+    GEMINI_API_KEY          (required)
+    GEMINI_FALLBACK_MODELS  comma-separated override of the fallback chain
+    GEMINI_THINKING_LEVEL   low (default) | medium | high | off
 
 Outputs (extension follows the input file):
     <output_prefix>_ar.<ext>          Arabic only
     <output_prefix>_bilingual.<ext>   English line + Arabic line
 
-Requires env var GEMINI_API_KEY. Uses only the Python standard library.
+Uses only the Python standard library.
 """
 
 import json
 import os
+import random
 import re
 import sys
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 
 CHUNK_SIZE = 50          # segments per request
 CONTEXT_BEFORE = 6       # previous segments (EN + AR) given as context
 CONTEXT_AFTER = 3        # upcoming EN segments given as lookahead
-MAX_RETRIES = 6
+
 DEFAULT_MODEL = "gemini-3.8-flash"
+# Ordered by quality; the primary model is always tried first.
+FALLBACK_CHAIN = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+]
+
+PER_MODEL_RETRIES = 3    # attempts per model before moving to the next one
+CHAIN_ROUNDS = 2         # full passes over the chain before giving up
+ROUND_WAIT = 45          # seconds between full passes
+COOLDOWN_SECS = 90       # skip a just-failed model for this long
+REQUEST_TIMEOUT = 240
+
+RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 TIMESTAMP_RE = re.compile(r"^\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}")
+
+COOLDOWN = {}            # model -> unix time until which it is skipped
+NO_THINKING = set()      # models that rejected thinkingConfig
+USED = Counter()         # successful requests per model
+
+
+class ApiUnavailable(Exception):
+    """Every model in the chain failed (overload / network / server errors)."""
+
+
+def get_thinking_level():
+    lvl = os.environ.get("GEMINI_THINKING_LEVEL", "low").strip().lower()
+    return None if lvl in ("", "off", "none") else lvl
+
+
+def build_chain(primary):
+    env = os.environ.get("GEMINI_FALLBACK_MODELS", "").strip()
+    fallbacks = [m.strip() for m in env.split(",") if m.strip()] if env else FALLBACK_CHAIN
+    chain = [primary]
+    for m in fallbacks:
+        if m not in chain:
+            chain.append(m)
+    return chain
 
 
 # ---------------------------------------------------------------- parsing
@@ -55,42 +107,91 @@ def parse_transcript(path):
 
 
 # ---------------------------------------------------------------- gemini
-def call_gemini(model, api_key, system, user, schema=None, temperature=0.3):
+def _build_body(system, user, schema, thinking):
     body = {
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": [{"text": user}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-        },
+        "generationConfig": {"responseMimeType": "application/json"},
     }
     if schema:
         body["generationConfig"]["responseSchema"] = schema
-    data = json.dumps(body).encode("utf-8")
-    url = API_URL.format(model=model)
+    if thinking:
+        body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": thinking}
+    return body
 
+
+def _post(model, api_key, body):
+    req = urllib.request.Request(
+        API_URL.format(model=model),
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+    )
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+        out = json.loads(resp.read().decode("utf-8"))
+    cand = out["candidates"][0]
+    parts = cand["content"]["parts"]
+    text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+    if not text.strip():
+        raise ValueError(f"empty response (finishReason={cand.get('finishReason')})")
+    return text
+
+
+def _sleep_backoff(attempt):
+    wait = min(2 ** attempt, 30)
+    wait += random.uniform(0, wait * 0.5)  # jitter
+    time.sleep(wait)
+    return wait
+
+
+def call_gemini(chain, api_key, system, user, schema=None, temperature=0.3):
+    """Try each model in `chain` (with retries) until one answers."""
+    level = get_thinking_level()
     last_err = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        req = urllib.request.Request(
-            url, data=data,
-            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                out = json.loads(resp.read().decode("utf-8"))
-            parts = out["candidates"][0]["content"]["parts"]
-            text = "".join(p.get("text", "") for p in parts)
-            return text
-        except urllib.error.HTTPError as e:
-            msg = e.read().decode("utf-8", "ignore")[:300]
-            last_err = f"HTTP {e.code}: {msg}"
-            if e.code in (400, 401, 403, 404):
-                raise SystemExit(f"ERROR: {last_err}")
-        except Exception as e:  # network, malformed response, etc.
-            last_err = repr(e)
-        wait = min(2 ** attempt, 60)
-        print(f"  API retry {attempt}/{MAX_RETRIES} in {wait}s ({last_err})")
-        time.sleep(wait)
-    raise SystemExit(f"ERROR: Gemini API failed after {MAX_RETRIES} retries: {last_err}")
+
+    for rnd in range(1, CHAIN_ROUNDS + 1):
+        now = time.time()
+        order = [m for m in chain if COOLDOWN.get(m, 0) <= now] or list(chain)
+
+        for model in order:
+            use_thinking = bool(level) and model not in NO_THINKING
+            for attempt in range(1, PER_MODEL_RETRIES + 1):
+                body = _build_body(system, user, schema, level if use_thinking else None)
+                try:
+                    text = _post(model, api_key, body)
+                    USED[model] += 1
+                    if model != chain[0]:
+                        print(f"  [fallback] answered by {model}")
+                    return text
+                except urllib.error.HTTPError as e:
+                    msg = e.read().decode("utf-8", "ignore")[:300]
+                    last_err = f"{model} HTTP {e.code}: {msg}"
+                    if e.code in (401, 403):
+                        raise SystemExit(f"ERROR: {last_err}")
+                    if e.code == 400 and use_thinking:
+                        NO_THINKING.add(model)
+                        use_thinking = False
+                        print(f"  {model}: thinkingConfig rejected, retrying without it")
+                        continue
+                    if e.code not in RETRYABLE_HTTP:
+                        print(f"  {model}: non-retryable HTTP {e.code}, skipping model")
+                        break
+                except Exception as e:  # network, timeout, malformed/empty response
+                    last_err = f"{model} {e!r}"
+
+                if attempt < PER_MODEL_RETRIES:
+                    print(f"  {model} retry {attempt}/{PER_MODEL_RETRIES - 1} ({last_err[:120]})")
+                    _sleep_backoff(attempt)
+
+            COOLDOWN[model] = time.time() + COOLDOWN_SECS
+            print(f"  {model} unavailable -> trying next model")
+
+        if rnd < CHAIN_ROUNDS:
+            wait = ROUND_WAIT + random.uniform(0, 15)
+            print(f"  all models failed (round {rnd}/{CHAIN_ROUNDS}); waiting {wait:.0f}s")
+            time.sleep(wait)
+            COOLDOWN.clear()
+
+    raise ApiUnavailable(f"all models failed after {CHAIN_ROUNDS} rounds: {last_err}")
 
 
 def clean_json(text):
@@ -124,7 +225,7 @@ CONTEXT_SCHEMA = {
 }
 
 
-def build_brief(model, api_key, segments):
+def build_brief(chain, api_key, segments):
     full = "\n".join(s["text"] for s in segments)[:400_000]
     prompt = (
         "Read this full transcript and return JSON with:\n"
@@ -137,8 +238,8 @@ def build_brief(model, api_key, segments):
         f"TRANSCRIPT:\n{full}"
     )
     try:
-        return clean_json(call_gemini(model, api_key, CONTEXT_SYSTEM, prompt, CONTEXT_SCHEMA, 0.2))
-    except Exception as e:
+        return clean_json(call_gemini(chain, api_key, CONTEXT_SYSTEM, prompt, CONTEXT_SCHEMA, 0.2))
+    except Exception as e:  # ApiUnavailable / bad JSON: continue without a brief
         print(f"  (context pass failed, continuing without brief: {e!r})")
         return {"domain": "", "summary": "", "tone": "", "glossary": []}
 
@@ -164,7 +265,7 @@ def brief_text(brief):
     )
 
 
-def translate_chunk(model, api_key, brief, segments, translations, start, end, depth=0):
+def translate_chunk(chain, api_key, brief, segments, translations, start, end, depth=0):
     """Translate segments[start:end]; returns list of Arabic strings (len == end-start)."""
     n = end - start
     before = range(max(0, start - CONTEXT_BEFORE), start)
@@ -185,12 +286,12 @@ def translate_chunk(model, api_key, brief, segments, translations, start, end, d
 
     for attempt in range(1, 4):
         try:
-            result = clean_json(call_gemini(model, api_key, TRANSLATE_SYSTEM, prompt, CHUNK_SCHEMA))
+            result = clean_json(call_gemini(chain, api_key, TRANSLATE_SYSTEM, prompt, CHUNK_SCHEMA))
             if isinstance(result, list) and len(result) == n and all(isinstance(x, str) for x in result):
                 return [x.strip() for x in result]
             got = len(result) if isinstance(result, list) else "?"
             print(f"  count mismatch (expected {n}, got {got}), attempt {attempt}/3")
-        except SystemExit:
+        except (SystemExit, ApiUnavailable):
             raise
         except Exception as e:
             print(f"  parse error attempt {attempt}/3: {e!r}")
@@ -200,10 +301,10 @@ def translate_chunk(model, api_key, brief, segments, translations, start, end, d
         return [segments[start]["text"]]
     mid = start + n // 2
     print(f"  splitting chunk {start+1}-{end} into halves")
-    left = translate_chunk(model, api_key, brief, segments, translations, start, mid, depth + 1)
+    left = translate_chunk(chain, api_key, brief, segments, translations, start, mid, depth + 1)
     for k, t in enumerate(left):
         translations[start + k] = t
-    right = translate_chunk(model, api_key, brief, segments, translations, mid, end, depth + 1)
+    right = translate_chunk(chain, api_key, brief, segments, translations, mid, end, depth + 1)
     return left + right
 
 
@@ -220,6 +321,11 @@ def write_output(path, segments, translations, bilingual):
 
 
 def main():
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     if len(sys.argv) not in (3, 4, 5):
         print("Usage: python translate_transcript.py <input> <output_prefix> [arabic|bilingual|both] [model]")
         sys.exit(1)
@@ -234,22 +340,32 @@ def main():
     if not api_key:
         sys.exit("ERROR: GEMINI_API_KEY environment variable is not set (add it as a GitHub secret).")
 
+    chain = build_chain(model)
     ext = os.path.splitext(input_path)[1] or ".txt"
     segments = parse_transcript(input_path)
     if not segments:
         sys.exit("ERROR: no segments found in input.")
-    print(f"Parsed {len(segments)} segments. Model: {model}")
-
-    print("Building context brief + glossary...")
-    brief = build_brief(model, api_key, segments)
-    print(f"  domain: {brief.get('domain')} | glossary terms: {len(brief.get('glossary', []))}")
+    print(f"Parsed {len(segments)} segments. Model chain: {' -> '.join(chain)}")
 
     translations = [None] * len(segments)
-    for start in range(0, len(segments), CHUNK_SIZE):
-        end = min(start + CHUNK_SIZE, len(segments))
-        print(f"Translating segments {start+1}-{end} / {len(segments)}...")
-        out = translate_chunk(model, api_key, brief, segments, translations, start, end)
-        translations[start:end] = out
+    try:
+        print("Building context brief + glossary...")
+        brief = build_brief(chain, api_key, segments)
+        print(f"  domain: {brief.get('domain')} | glossary terms: {len(brief.get('glossary', []))}")
+
+        for start in range(0, len(segments), CHUNK_SIZE):
+            end = min(start + CHUNK_SIZE, len(segments))
+            print(f"Translating segments {start+1}-{end} / {len(segments)}...")
+            out = translate_chunk(chain, api_key, brief, segments, translations, start, end)
+            translations[start:end] = out
+    except ApiUnavailable as e:
+        done = sum(1 for t in translations if t is not None)
+        print(f"ERROR: {e}")
+        partial = [t if t is not None else s["text"] for s, t in zip(segments, translations)]
+        p = f"{prefix}_ar_partial{ext}"
+        write_output(p, segments, partial, bilingual=False)
+        print(f"Saved partial result ({done}/{len(segments)} translated, rest kept in English): {p}")
+        sys.exit(1)
 
     if mode in ("arabic", "both"):
         p = f"{prefix}_ar{ext}"
@@ -259,6 +375,9 @@ def main():
         p = f"{prefix}_bilingual{ext}"
         write_output(p, segments, translations, bilingual=True)
         print(f"Wrote {p}")
+
+    summary = ", ".join(f"{m}: {c}" for m, c in USED.most_common())
+    print(f"Requests per model -> {summary}")
     print("Done.")
 
 
