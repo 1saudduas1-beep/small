@@ -34,6 +34,30 @@ on:
           - large-v3
           - distil-large-v3
 
+      translate:
+        description: 'Translate transcript to Arabic with Gemini'
+        required: false
+        default: true
+        type: boolean
+      translation_output:
+        description: 'Translation output'
+        required: false
+        default: 'arabic'
+        type: choice
+        options:
+          - arabic
+          - bilingual
+          - both
+      gemini_model:
+        description: 'Gemini model name'
+        required: false
+        default: 'gemini-3.8-flash'
+        type: choice
+        options:
+          - gemini-3.8-flash
+          - gemini-3.1-pro-preview
+          - gemini-3.7-flash
+
 jobs:
   transcribe:
     runs-on: ubuntu-latest
@@ -104,9 +128,20 @@ jobs:
         run: |
           python transcribe.py input_audio.mp4 "${{ github.event.inputs.base_name }}.${{ github.event.inputs.output_format }}" "${{ github.event.inputs.output_format }}" "${{ github.event.inputs.model_size }}"
 
+      - name: Translate to Arabic with Gemini
+        if: ${{ github.event.inputs.translate == 'true' }}
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python translate_transcript.py \
+            "${{ github.event.inputs.base_name }}.${{ github.event.inputs.output_format }}" \
+            "${{ github.event.inputs.base_name }}" \
+            "${{ github.event.inputs.translation_output }}" \
+            "${{ github.event.inputs.gemini_model }}"
+
       - name: Upload transcript artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.base_name }}
-          path: ${{ github.event.inputs.base_name }}.${{ github.event.inputs.output_format }}
+          path: ${{ github.event.inputs.base_name }}*.${{ github.event.inputs.output_format }}
           retention-days: 14
