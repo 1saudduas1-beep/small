@@ -49,14 +49,16 @@ on:
           - bilingual
           - both
       gemini_model:
-        description: 'Gemini model name'
+        description: 'Primary Gemini model (others are used automatically as fallback on 503)'
         required: false
         default: 'gemini-3.8-flash'
         type: choice
         options:
           - gemini-3.8-flash
-          - gemini-3.1-pro-preview
           - gemini-3.7-flash
+          - gemini-3.5-flash-lite
+          - gemini-3.1-flash-lite
+          - gemini-3.1-pro-preview
 
 jobs:
   transcribe:
@@ -132,6 +134,10 @@ jobs:
         if: ${{ github.event.inputs.translate == 'true' }}
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Optional: comma-separated override of the fallback chain, e.g.
+          # GEMINI_FALLBACK_MODELS: gemini-3.7-flash,gemini-3.5-flash-lite
+          # Optional: low (default) | medium | high | off
+          # GEMINI_THINKING_LEVEL: low
         run: |
           python translate_transcript.py \
             "${{ github.event.inputs.base_name }}.${{ github.event.inputs.output_format }}" \
@@ -139,7 +145,10 @@ jobs:
             "${{ github.event.inputs.translation_output }}" \
             "${{ github.event.inputs.gemini_model }}"
 
+      # Runs even if translation failed, so the Whisper transcript (and any
+      # partial translation) is never lost. The job still ends red on failure.
       - name: Upload transcript artifact
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.base_name }}
