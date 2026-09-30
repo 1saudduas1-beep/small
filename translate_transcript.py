@@ -8,17 +8,20 @@ Usage:
     mode:  "arabic" (default) | "bilingual" | "both"
     model: primary Gemini model name (default: gemini-3.8-flash)
 
-Resilience (HTTP 503 / overload):
-    Every request walks a fallback chain: primary model -> FALLBACK_CHAIN.
-    Each model gets a few jittered-backoff retries, then the next model is
-    tried. A model that just failed is skipped for COOLDOWN_SECS so later
-    requests do not waste time on it. If the whole chain fails, a partial
-    file (<prefix>_ar_partial.<ext>) is written and the script exits 1.
+Resilience:
+    * Every request walks a fallback chain: primary model -> FALLBACK_CHAIN.
+    * 503/500/network errors: jittered backoff, then the next model.
+    * 429: a per-day quota (free tier) skips that model for the whole run;
+      a short per-minute limit waits the server-provided retryDelay.
+    * Truncated / blocked responses split the chunk instead of blind retries.
+    * Results are id-matched (not just counted) and checked for untranslated text.
+    * A global deadline stops the run and saves <prefix>_ar_partial.<ext>.
 
 Optional env vars:
     GEMINI_API_KEY          (required)
     GEMINI_FALLBACK_MODELS  comma-separated override of the fallback chain
-    GEMINI_THINKING_LEVEL   low (default) | medium | high | off
+    GEMINI_THINKING_LEVEL   medium (default) | low | high | off
+    TRANSLATE_MAX_MINUTES   global time budget (default 120)
 
 Outputs (extension follows the input file):
     <output_prefix>_ar.<ext>          Arabic only
@@ -54,24 +57,34 @@ PER_MODEL_RETRIES = 3    # attempts per model before moving to the next one
 CHAIN_ROUNDS = 2         # full passes over the chain before giving up
 ROUND_WAIT = 45          # seconds between full passes
 COOLDOWN_SECS = 90       # skip a just-failed model for this long
+MAX_SERVER_DELAY = 90    # honour a 429 retryDelay only up to this many seconds
 REQUEST_TIMEOUT = 240
+DEFAULT_MAX_MINUTES = 120
 
 RETRYABLE_HTTP = {429, 500, 502, 503, 504}
+BLOCK_REASONS = {"SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"}
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 TIMESTAMP_RE = re.compile(r"^\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}")
+ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
 
 COOLDOWN = {}            # model -> unix time until which it is skipped
+DAILY_EXHAUSTED = set()  # models whose per-day quota is gone for this run
 NO_THINKING = set()      # models that rejected thinkingConfig
 USED = Counter()         # successful requests per model
+DEADLINE = [float("inf")]
 
 
 class ApiUnavailable(Exception):
-    """Every model in the chain failed (overload / network / server errors)."""
+    """Every model failed (overload / quota / network) or the deadline passed."""
+
+
+class ResponseRejected(Exception):
+    """The model answered but the output is unusable (truncated / blocked)."""
 
 
 def get_thinking_level():
-    lvl = os.environ.get("GEMINI_THINKING_LEVEL", "low").strip().lower()
+    lvl = os.environ.get("GEMINI_THINKING_LEVEL", "medium").strip().lower()
     return None if lvl in ("", "off", "none") else lvl
 
 
@@ -128,33 +141,63 @@ def _post(model, api_key, body):
     )
     with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
         out = json.loads(resp.read().decode("utf-8"))
-    cand = out["candidates"][0]
-    parts = cand["content"]["parts"]
+
+    block = (out.get("promptFeedback") or {}).get("blockReason")
+    if block:
+        raise ResponseRejected(f"prompt blocked ({block})")
+    cands = out.get("candidates") or []
+    if not cands:
+        raise ValueError("no candidates in response")
+    cand = cands[0]
+    finish = cand.get("finishReason")
+    if finish == "MAX_TOKENS":
+        raise ResponseRejected("output truncated (MAX_TOKENS)")
+    if finish in BLOCK_REASONS:
+        raise ResponseRejected(f"response blocked ({finish})")
+    parts = (cand.get("content") or {}).get("parts") or []
     text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
     if not text.strip():
-        raise ValueError(f"empty response (finishReason={cand.get('finishReason')})")
+        raise ValueError(f"empty response (finishReason={finish})")
     return text
 
 
-def _sleep_backoff(attempt):
+def _check_deadline():
+    if time.time() > DEADLINE[0]:
+        raise ApiUnavailable("global time budget reached")
+
+
+def _sleep(seconds):
+    _check_deadline()
+    time.sleep(max(0.0, min(seconds, DEADLINE[0] - time.time())))
+
+
+def _backoff(attempt):
     wait = min(2 ** attempt, 30)
-    wait += random.uniform(0, wait * 0.5)  # jitter
-    time.sleep(wait)
-    return wait
+    _sleep(wait + random.uniform(0, wait * 0.5))  # jitter
 
 
-def call_gemini(chain, api_key, system, user, schema=None, temperature=0.3):
+def _retry_delay(raw):
+    m = (re.search(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', raw)
+         or re.search(r"retry in (\d+(?:\.\d+)?)s", raw))
+    return float(m.group(1)) if m else None
+
+
+def call_gemini(chain, api_key, system, user, schema=None):
     """Try each model in `chain` (with retries) until one answers."""
     level = get_thinking_level()
     last_err = None
 
     for rnd in range(1, CHAIN_ROUNDS + 1):
         now = time.time()
-        order = [m for m in chain if COOLDOWN.get(m, 0) <= now] or list(chain)
+        alive = [m for m in chain if m not in DAILY_EXHAUSTED]
+        if not alive:
+            raise ApiUnavailable(f"daily quota exhausted on every model ({last_err})")
+        order = [m for m in alive if COOLDOWN.get(m, 0) <= now] or alive
 
         for model in order:
             use_thinking = bool(level) and model not in NO_THINKING
             for attempt in range(1, PER_MODEL_RETRIES + 1):
+                _check_deadline()
                 body = _build_body(system, user, schema, level if use_thinking else None)
                 try:
                     text = _post(model, api_key, body)
@@ -162,9 +205,11 @@ def call_gemini(chain, api_key, system, user, schema=None, temperature=0.3):
                     if model != chain[0]:
                         print(f"  [fallback] answered by {model}")
                     return text
+                except ResponseRejected:
+                    raise
                 except urllib.error.HTTPError as e:
-                    msg = e.read().decode("utf-8", "ignore")[:300]
-                    last_err = f"{model} HTTP {e.code}: {msg}"
+                    raw = e.read().decode("utf-8", "ignore")
+                    last_err = f"{model} HTTP {e.code}: {raw[:200]}"
                     if e.code in (401, 403):
                         raise SystemExit(f"ERROR: {last_err}")
                     if e.code == 400 and use_thinking:
@@ -172,7 +217,21 @@ def call_gemini(chain, api_key, system, user, schema=None, temperature=0.3):
                         use_thinking = False
                         print(f"  {model}: thinkingConfig rejected, retrying without it")
                         continue
-                    if e.code not in RETRYABLE_HTTP:
+                    if e.code == 429:
+                        delay = _retry_delay(raw)
+                        if "PerDay" in raw:
+                            DAILY_EXHAUSTED.add(model)
+                            print(f"  {model}: daily quota exhausted -> skipping for this run")
+                            break
+                        if delay is not None and delay > MAX_SERVER_DELAY:
+                            print(f"  {model}: quota reset in {delay:.0f}s -> skipping model")
+                            break
+                        if attempt < PER_MODEL_RETRIES:
+                            wait = (delay if delay is not None else 2 ** attempt) + random.uniform(1, 3)
+                            print(f"  {model}: rate limited, waiting {wait:.0f}s")
+                            _sleep(wait)
+                            continue
+                    elif e.code not in RETRYABLE_HTTP:
                         print(f"  {model}: non-retryable HTTP {e.code}, skipping model")
                         break
                 except Exception as e:  # network, timeout, malformed/empty response
@@ -180,7 +239,7 @@ def call_gemini(chain, api_key, system, user, schema=None, temperature=0.3):
 
                 if attempt < PER_MODEL_RETRIES:
                     print(f"  {model} retry {attempt}/{PER_MODEL_RETRIES - 1} ({last_err[:120]})")
-                    _sleep_backoff(attempt)
+                    _backoff(attempt)
 
             COOLDOWN[model] = time.time() + COOLDOWN_SECS
             print(f"  {model} unavailable -> trying next model")
@@ -188,7 +247,7 @@ def call_gemini(chain, api_key, system, user, schema=None, temperature=0.3):
         if rnd < CHAIN_ROUNDS:
             wait = ROUND_WAIT + random.uniform(0, 15)
             print(f"  all models failed (round {rnd}/{CHAIN_ROUNDS}); waiting {wait:.0f}s")
-            time.sleep(wait)
+            _sleep(wait)
             COOLDOWN.clear()
 
     raise ApiUnavailable(f"all models failed after {CHAIN_ROUNDS} rounds: {last_err}")
@@ -238,8 +297,10 @@ def build_brief(chain, api_key, segments):
         f"TRANSCRIPT:\n{full}"
     )
     try:
-        return clean_json(call_gemini(chain, api_key, CONTEXT_SYSTEM, prompt, CONTEXT_SCHEMA, 0.2))
-    except Exception as e:  # ApiUnavailable / bad JSON: continue without a brief
+        return clean_json(call_gemini(chain, api_key, CONTEXT_SYSTEM, prompt, CONTEXT_SCHEMA))
+    except ApiUnavailable:
+        raise
+    except Exception as e:  # bad JSON / rejected output: continue without a brief
         print(f"  (context pass failed, continuing without brief: {e!r})")
         return {"domain": "", "summary": "", "tone": "", "glossary": []}
 
@@ -251,10 +312,18 @@ Rules:
 2. Translate by MEANING and CONTEXT: segments are fragments of continuing sentences, so use the surrounding segments to resolve pronouns, ambiguity and idioms. Never translate idioms literally.
 3. Use established Arabic scientific/medical terminology. On a term's first appearance, put the English term in parentheses after the Arabic; afterwards use Arabic only. Follow the provided glossary exactly for consistency.
 4. Keep numbers, units, drug/anatomical names accurate. Keep proper nouns, brands and acronyms in Latin script when customary (e.g. CT, MRI).
-5. Output EXACTLY one Arabic string per input segment, in the same order. Never merge, split, skip or add segments. A short interjection ("Yeah.", "Right.") gets a short natural Arabic equivalent.
-6. Return only JSON: an array of strings."""
+5. Input items are objects {"i": number, "en": text}. Output EXACTLY one object {"i": same number, "ar": Arabic translation} per input item, in the same order. Never merge, split, skip or add items. A short interjection ("Yeah.", "Right.") gets a short natural Arabic equivalent.
+6. Return only JSON: an array of {"i", "ar"} objects."""
 
-CHUNK_SCHEMA = {"type": "ARRAY", "items": {"type": "STRING"}}
+CHUNK_SCHEMA = {
+    "type": "ARRAY",
+    "items": {
+        "type": "OBJECT",
+        "properties": {"i": {"type": "INTEGER"}, "ar": {"type": "STRING"}},
+        "required": ["i", "ar"],
+        "propertyOrdering": ["i", "ar"],
+    },
+}
 
 
 def brief_text(brief):
@@ -263,6 +332,28 @@ def brief_text(brief):
         f"Domain: {brief.get('domain','')}\nSummary: {brief.get('summary','')}\n"
         f"Arabic tone: {brief.get('tone','')}\nGlossary:\n{gl}"
     )
+
+
+def validate_result(result, texts):
+    """Return (list of Arabic strings in order, None) or (None, reason)."""
+    n = len(texts)
+    if not isinstance(result, list) or len(result) != n:
+        got = len(result) if isinstance(result, list) else "?"
+        return None, f"count mismatch (expected {n}, got {got})"
+    by_id = {}
+    for r in result:
+        if not isinstance(r, dict) or not isinstance(r.get("i"), int) or not isinstance(r.get("ar"), str):
+            return None, "malformed item"
+        by_id[r["i"]] = r["ar"].strip()
+    if set(by_id) != set(range(1, n + 1)):
+        return None, "ids do not match input"
+    out = [by_id[k] for k in range(1, n + 1)]
+    for en, ar in zip(texts, out):
+        if en.strip() and not ar:
+            return None, "empty translation"
+        if len(en) >= 30 and not ARABIC_RE.search(ar):
+            return None, "segment left untranslated"
+    return out, None
 
 
 def translate_chunk(chain, api_key, brief, segments, translations, start, end, depth=0):
@@ -275,24 +366,29 @@ def translate_chunk(chain, api_key, brief, segments, translations, start, end, d
         f"EN: {segments[i]['text']}\nAR: {translations[i]}" for i in before if translations[i] is not None
     )
     ctx_next = "\n".join(segments[i]["text"] for i in after)
-    items = json.dumps([segments[i]["text"] for i in range(start, end)], ensure_ascii=False)
+    texts = [segments[i]["text"] for i in range(start, end)]
+    items = json.dumps([{"i": k + 1, "en": t} for k, t in enumerate(texts)], ensure_ascii=False)
 
     prompt = (
         f"{brief_text(brief)}\n\n"
         f"PREVIOUS SEGMENTS (already translated, for continuity only):\n{ctx_prev or '(none)'}\n\n"
         f"UPCOMING SEGMENTS (context only, do NOT translate):\n{ctx_next or '(none)'}\n\n"
-        f"TRANSLATE these {n} segments. Return a JSON array of exactly {n} Arabic strings:\n{items}"
+        f"TRANSLATE these {n} items. Return a JSON array of exactly {n} objects "
+        f'{{"i", "ar"}}:\n{items}'
     )
 
     for attempt in range(1, 4):
         try:
             result = clean_json(call_gemini(chain, api_key, TRANSLATE_SYSTEM, prompt, CHUNK_SCHEMA))
-            if isinstance(result, list) and len(result) == n and all(isinstance(x, str) for x in result):
-                return [x.strip() for x in result]
-            got = len(result) if isinstance(result, list) else "?"
-            print(f"  count mismatch (expected {n}, got {got}), attempt {attempt}/3")
+            out, why = validate_result(result, texts)
+            if out is not None:
+                return out
+            print(f"  invalid result: {why}, attempt {attempt}/3")
         except (SystemExit, ApiUnavailable):
             raise
+        except ResponseRejected as e:
+            print(f"  response rejected: {e}")
+            break  # retrying the same chunk will not help; split it instead
         except Exception as e:
             print(f"  parse error attempt {attempt}/3: {e!r}")
 
@@ -340,12 +436,19 @@ def main():
     if not api_key:
         sys.exit("ERROR: GEMINI_API_KEY environment variable is not set (add it as a GitHub secret).")
 
+    try:
+        minutes = float(os.environ.get("TRANSLATE_MAX_MINUTES", DEFAULT_MAX_MINUTES))
+    except ValueError:
+        minutes = DEFAULT_MAX_MINUTES
+    DEADLINE[0] = time.time() + minutes * 60
+
     chain = build_chain(model)
     ext = os.path.splitext(input_path)[1] or ".txt"
     segments = parse_transcript(input_path)
     if not segments:
         sys.exit("ERROR: no segments found in input.")
-    print(f"Parsed {len(segments)} segments. Model chain: {' -> '.join(chain)}")
+    print(f"Parsed {len(segments)} segments. Model chain: {' -> '.join(chain)} "
+          f"| thinking: {get_thinking_level() or 'default'} | budget: {minutes:.0f} min")
 
     translations = [None] * len(segments)
     try:
