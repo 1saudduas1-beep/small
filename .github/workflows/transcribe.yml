@@ -15,7 +15,7 @@ on:
       output_format:
         description: 'Output format'
         required: false
-        default: 'srt'
+        default: 'txt'
         type: choice
         options:
           - srt
@@ -49,7 +49,7 @@ on:
           - bilingual
           - both
       gemini_model:
-        description: 'Primary Gemini model (others are used automatically as fallback on 503)'
+        description: 'Primary Gemini model (others are used automatically as fallback)'
         required: false
         default: 'gemini-3.8-flash'
         type: choice
@@ -60,12 +60,38 @@ on:
           - gemini-3.1-flash-lite
           - gemini-3.1-pro-preview
 
+# Least privilege: this workflow only needs to read the repository.
+permissions:
+  contents: read
+
 jobs:
   transcribe:
     runs-on: ubuntu-latest
     timeout-minutes: 300
 
+    # Untrusted inputs are passed through environment variables and only ever
+    # referenced as quoted shell variables ("$VAR"), never expanded inline with
+    # ${{ }} inside `run:` scripts (prevents script injection).
+    env:
+      SHARE_URL: ${{ github.event.inputs.share_url }}
+      BASE_NAME: ${{ github.event.inputs.base_name }}
+      OUTPUT_FORMAT: ${{ github.event.inputs.output_format }}
+      MODEL_SIZE: ${{ github.event.inputs.model_size }}
+      TRANSLATION_OUTPUT: ${{ github.event.inputs.translation_output }}
+      GEMINI_MODEL: ${{ github.event.inputs.gemini_model }}
+
     steps:
+      - name: Validate inputs
+        run: |
+          if [[ ! "$BASE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+            echo "::error::base_name must be 1-64 chars: letters, digits, '.', '_' or '-' (starting with a letter or digit)."
+            exit 1
+          fi
+          if [[ ! "$SHARE_URL" =~ ^https://[^[:space:]]+$ ]]; then
+            echo "::error::share_url must be a single https:// link."
+            exit 1
+          fi
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -97,7 +123,7 @@ jobs:
 
       - name: Extract direct audio URL from share link
         run: |
-          python extract_audio_url.py "${{ github.event.inputs.share_url }}" audio_url.txt
+          python extract_audio_url.py "$SHARE_URL" audio_url.txt
 
       - name: Download audio from extracted direct link
         run: |
@@ -128,22 +154,25 @@ jobs:
 
       - name: Transcribe with faster-whisper
         run: |
-          python transcribe.py input_audio.mp4 "${{ github.event.inputs.base_name }}.${{ github.event.inputs.output_format }}" "${{ github.event.inputs.output_format }}" "${{ github.event.inputs.model_size }}"
+          python transcribe.py input_audio.mp4 "$BASE_NAME.$OUTPUT_FORMAT" "$OUTPUT_FORMAT" "$MODEL_SIZE"
 
       - name: Translate to Arabic with Gemini
         if: ${{ github.event.inputs.translate == 'true' }}
+        timeout-minutes: 150
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          # Optional: comma-separated override of the fallback chain, e.g.
+          # Global time budget inside the script; on expiry a partial file is saved.
+          TRANSLATE_MAX_MINUTES: '120'
+          # Optional: medium (default) | low | high | off
+          # GEMINI_THINKING_LEVEL: medium
+          # Optional: override the fallback chain (comma-separated)
           # GEMINI_FALLBACK_MODELS: gemini-3.7-flash,gemini-3.5-flash-lite
-          # Optional: low (default) | medium | high | off
-          # GEMINI_THINKING_LEVEL: low
         run: |
           python translate_transcript.py \
-            "${{ github.event.inputs.base_name }}.${{ github.event.inputs.output_format }}" \
-            "${{ github.event.inputs.base_name }}" \
-            "${{ github.event.inputs.translation_output }}" \
-            "${{ github.event.inputs.gemini_model }}"
+            "$BASE_NAME.$OUTPUT_FORMAT" \
+            "$BASE_NAME" \
+            "$TRANSLATION_OUTPUT" \
+            "$GEMINI_MODEL"
 
       # Runs even if translation failed, so the Whisper transcript (and any
       # partial translation) is never lost. The job still ends red on failure.
