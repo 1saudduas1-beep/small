@@ -1,185 +1,124 @@
-name: Transcribe Audio
+"""
+Transcribes an audio file using faster-whisper (English only) and writes
+the result as either:
+  - srt: numbered segments with start/end timestamps
+  - txt: numbered segments with the timestamps removed
 
-on:
-  workflow_dispatch:
-    inputs:
-      share_url:
-        description: 'NotebookLM Audio Overview share link'
-        required: true
-        type: string
-      base_name:
-        description: 'Output file base name (optional)'
-        required: false
-        default: 'transcript'
-        type: string
-      output_format:
-        description: 'Output format'
-        required: false
-        default: 'srt'
-        type: choice
-        options:
-          - srt
-          - txt
-      model_size:
-        description: 'Whisper model size'
-        required: false
-        default: 'small'
-        type: choice
-        options:
-          - tiny
-          - base
-          - small
-          - medium
-          - large-v2
-          - large-v3
-          - distil-large-v3
+Usage:
+    python transcribe.py <input_audio_path> <output_path> [format] [model_size]
 
-      translate:
-        description: 'Translate transcript to Arabic with Gemini'
-        required: false
-        default: true
-        type: boolean
-      translation_output:
-        description: 'Translation output'
-        required: false
-        default: 'arabic'
-        type: choice
-        options:
-          - arabic
-          - bilingual
-          - both
-      gemini_model:
-        description: 'Primary Gemini model (others are used automatically as fallback)'
-        required: false
-        default: 'gemini-3.8-flash'
-        type: choice
-        options:
-          - gemini-3.8-flash
-          - gemini-3.7-flash
-          - gemini-3.5-flash-lite
-          - gemini-3.1-flash-lite
-          - gemini-3.1-pro-preview
+    format:     "srt" (default) or "txt"
+    model_size: any faster-whisper model size, e.g. "tiny", "base",
+                "small" (default), "medium", "large-v2", "large-v3",
+                "distil-large-v3"
+"""
 
-# Least privilege: this workflow only needs to read the repository.
-permissions:
-  contents: read
+import os
+import sys
+from faster_whisper import WhisperModel
 
-jobs:
-  transcribe:
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
+VALID_MODEL_SIZES = {
+    "tiny", "base", "small", "medium", "large-v2", "large-v3", "distil-large-v3",
+}
 
-    # Untrusted inputs are passed through environment variables and only ever
-    # referenced as quoted shell variables ("$VAR"), never expanded inline with
-    # ${{ }} inside `run:` scripts (prevents script injection).
-    env:
-      SHARE_URL: ${{ github.event.inputs.share_url }}
-      BASE_NAME: ${{ github.event.inputs.base_name }}
-      OUTPUT_FORMAT: ${{ github.event.inputs.output_format }}
-      MODEL_SIZE: ${{ github.event.inputs.model_size }}
-      TRANSLATION_OUTPUT: ${{ github.event.inputs.translation_output }}
-      GEMINI_MODEL: ${{ github.event.inputs.gemini_model }}
 
-    steps:
-      - name: Validate inputs
-        run: |
-          if [[ ! "$BASE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
-            echo "::error::base_name must be 1-64 chars: letters, digits, '.', '_' or '-' (starting with a letter or digit)."
-            exit 1
-          fi
-          if [[ ! "$SHARE_URL" =~ ^https://[^[:space:]]+$ ]]; then
-            echo "::error::share_url must be a single https:// link."
-            exit 1
-          fi
+def format_timestamp(total_seconds: float) -> str:
+    """Format seconds as SRT timestamp: HH:MM:SS,mmm"""
+    if total_seconds < 0:
+        total_seconds = 0
+    hours = int(total_seconds // 3600)
+    minutes = int((total_seconds % 3600) // 60)
+    seconds = int(total_seconds % 60)
+    milliseconds = int(round((total_seconds - int(total_seconds)) * 1000))
+    if milliseconds == 1000:
+        milliseconds = 0
+        seconds += 1
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
-      - name: Checkout repository
-        uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+def write_srt(segments, output_path: str) -> int:
+    """Write numbered segments with timestamps (standard .srt)."""
+    count = 0
+    with open(output_path, "w", encoding="utf-8") as f:
+        for i, segment in enumerate(segments, start=1):
+            start = format_timestamp(segment.start)
+            end = format_timestamp(segment.end)
+            text = segment.text.strip()
+            f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
+            print(f"  [{start} --> {end}] {text}")
+            count += 1
+    return count
 
-      - name: Install ffmpeg and aria2
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg aria2
 
-      - name: Install Python dependencies
-        run: |
-          pip install faster-whisper playwright
-          playwright install --with-deps chromium
+def write_txt(segments, output_path: str) -> int:
+    """Write numbered segments WITHOUT timestamps."""
+    count = 0
+    with open(output_path, "w", encoding="utf-8") as f:
+        for i, segment in enumerate(segments, start=1):
+            text = segment.text.strip()
+            f.write(f"{i}\n{text}\n\n")
+            print(f"  [{i}] {text}")
+            count += 1
+    return count
 
-      - name: Cache Whisper model
-        uses: actions/cache@v4
-        with:
-          # faster-whisper downloads model weights via huggingface_hub,
-          # which stores them here by default. Caching this path avoids
-          # re-downloading the same model on every run.
-          path: ~/.cache/huggingface
-          # Keyed on the selected model size so switching sizes just adds
-          # a new cache entry instead of invalidating the old one.
-          key: hf-whisper-${{ github.event.inputs.model_size }}
 
-      - name: Extract direct audio URL from share link
-        run: |
-          python extract_audio_url.py "$SHARE_URL" audio_url.txt
+WRITERS = {
+    "srt": write_srt,
+    "txt": write_txt,
+}
 
-      - name: Download audio from extracted direct link
-        run: |
-          # The captured googlevideo.com URL is signed/IP-locked and time-limited,
-          # so a single-connection curl download was the main bottleneck for
-          # large audio files. aria2c splits the download into parallel
-          # connections against the same URL (the host supports HTTP Range
-          # requests), which cuts download time dramatically while keeping
-          # the same retry/User-Agent behavior.
-          aria2c \
-            --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
-            --max-connection-per-server=16 \
-            --split=16 \
-            --min-split-size=1M \
-            --max-tries=3 \
-            --retry-wait=2 \
-            --continue=true \
-            --allow-overwrite=true \
-            --console-log-level=warn \
-            --summary-interval=5 \
-            --out=input_audio.mp4 \
-            "$(cat audio_url.txt)"
 
-      - name: Verify download
-        run: |
-          ls -lh input_audio.mp4
-          ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1 input_audio.mp4
+def main():
+    if len(sys.argv) not in (3, 4, 5):
+        print(
+            "Usage: python transcribe.py <input_audio_path> <output_path> "
+            "[srt|txt] [model_size]"
+        )
+        sys.exit(1)
 
-      - name: Transcribe with faster-whisper
-        run: |
-          python transcribe.py input_audio.mp4 "$BASE_NAME.$OUTPUT_FORMAT" "$OUTPUT_FORMAT" "$MODEL_SIZE"
+    input_path = sys.argv[1]
+    output_path = sys.argv[2]
+    output_format = sys.argv[3].strip().lower() if len(sys.argv) >= 4 else "srt"
+    model_size = sys.argv[4].strip().lower() if len(sys.argv) == 5 else "small"
 
-      - name: Translate to Arabic with Gemini
-        if: ${{ github.event.inputs.translate == 'true' }}
-        timeout-minutes: 150
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          # Global time budget inside the script; on expiry a partial file is saved.
-          TRANSLATE_MAX_MINUTES: '120'
-          # Optional: medium (default) | low | high | off
-          # GEMINI_THINKING_LEVEL: medium
-          # Optional: override the fallback chain (comma-separated)
-          # GEMINI_FALLBACK_MODELS: gemini-3.7-flash,gemini-3.5-flash-lite
-        run: |
-          python translate_transcript.py \
-            "$BASE_NAME.$OUTPUT_FORMAT" \
-            "$BASE_NAME" \
-            "$TRANSLATION_OUTPUT" \
-            "$GEMINI_MODEL"
+    if output_format not in WRITERS:
+        print(f"ERROR: unsupported format '{output_format}'. Use 'srt' or 'txt'.", file=sys.stderr)
+        sys.exit(1)
 
-      # Runs even if translation failed, so the Whisper transcript (and any
-      # partial translation) is never lost. The job still ends red on failure.
-      - name: Upload transcript artifact
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ github.event.inputs.base_name }}
-          path: ${{ github.event.inputs.base_name }}*.${{ github.event.inputs.output_format }}
-          retention-days: 14
+    if model_size not in VALID_MODEL_SIZES:
+        print(
+            f"ERROR: unsupported model_size '{model_size}'. "
+            f"Choose one of: {', '.join(sorted(VALID_MODEL_SIZES))}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Auto-detect available CPU cores so this adapts automatically whether
+    # the runner has 2 vCPUs (private repo) or 4 vCPUs (public repo),
+    # without needing a code change if that ever changes.
+    cpu_threads = os.cpu_count() or 4
+    print(f"Loading model '{model_size}' (int8, CPU, cpu_threads={cpu_threads})...")
+    model = WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=cpu_threads)
+
+    print(f"Transcribing '{input_path}' (language=en)...")
+    segments, info = model.transcribe(
+        input_path,
+        language="en",
+        beam_size=5,
+        vad_filter=True,  # skip silence, useful for AI-generated podcasts
+    )
+
+    print(f"Detected duration: {info.duration:.1f}s")
+
+    # faster-whisper returns a generator; materialize once so we can
+    # both print progress and hand it to the chosen writer without
+    # re-running transcription.
+    segments = list(segments)
+
+    count = WRITERS[output_format](segments, output_path)
+
+    print(f"Done. Wrote {count} segments to '{output_path}' (format={output_format}).")
+
+
+if __name__ == "__main__":
+    main()
