@@ -346,8 +346,10 @@ jobs:
 
       - name: Translate to Arabic with Gemini
         if: ${{ github.event.inputs.translate == 'true' }}
-        # Follows the chosen budget (+20 min margin for saving partial output / checkpoint).
-        timeout-minutes: ${{ fromJSON(github.event.inputs.translate_max_minutes || '30') + 20 }}
+        # GitHub expressions have no arithmetic, so the step cap is fixed at the maximum budget
+        # (200) + 20 min margin. The real limit is enforced by the script itself
+        # (TRANSLATE_MAX_MINUTES), which saves partial output + checkpoint when it is reached.
+        timeout-minutes: 220
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           # Optional extra keys (empty secrets are ignored by the script).
