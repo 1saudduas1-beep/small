@@ -43,6 +43,8 @@ Resilience
       After 2 consecutive failures a model is demoted (tried last) for 10 minutes.
       Only if the whole chain fails do the "last resort" lite models answer, and
       every unit they touch is sent to review.
+    * Sticky success: the model that answered last is tried first for STICKY_SECS
+      (5 min) while it stays healthy; a failure of that model cancels the priority.
     * Batches are translated in parallel (TRANSLATE_PARALLEL workers, one key each
       at a time). The previous paragraphs given as context are then the English
       source (consistency comes from the glossary and the marked terms).
@@ -118,6 +120,7 @@ REVIEW_BATCH = 10
 OVERLOAD_HTTP = {503}        # model overloaded: fail over at once, never rotate keys
 DEMOTE_AFTER = 2             # consecutive failures before a model is demoted
 DEMOTE_SECS = 600            # a demoted model is tried last for this long
+STICKY_SECS = 300            # the model that just succeeded is tried FIRST for this long
 PROOF_BATCH = 40
 CONTEXT_PATIENCE = 420
 RETRY_PAUSE = (45, 75)       # seconds to pause between translation rounds when models are busy
@@ -155,6 +158,7 @@ ABORT = [False]
 PARALLEL = [1]
 DEMOTED = {}             # model -> unix time until which it is tried last
 MODEL_FAILS = Counter()  # consecutive failures per model
+STICKY = [None, 0.0]     # [model that answered last, unix time until which it is tried first]
 WAIT = [0.0]             # seconds spent sleeping (summed over threads)
 TIMINGS = []             # (stage, seconds, requests)
 STAGE_END = [float("inf")]
@@ -256,6 +260,8 @@ def run_parallel(fn, items, workers, on_done):
 def note_failure(model):
     with LOCK:
         MODEL_FAILS[model] += 1
+        if STICKY[0] == model:
+            STICKY[0], STICKY[1] = None, 0.0
         if MODEL_FAILS[model] >= DEMOTE_AFTER:
             DEMOTED[model] = time.time() + DEMOTE_SECS
             if MODEL_FAILS[model] == DEMOTE_AFTER:
@@ -267,6 +273,7 @@ def note_success(model):
         USED[model] += 1
         MODEL_FAILS[model] = 0
         DEMOTED.pop(model, None)
+        STICKY[0], STICKY[1] = model, time.time() + STICKY_SECS
 
 
 class ApiUnavailable(Exception):
@@ -513,6 +520,9 @@ def call_gemini(chain, system, user, schema=None, level="default", patience=None
         now = time.time()
         with LOCK:
             ready = [m for m in live if MODEL_COOL.get(m, 0) <= now and DEMOTED.get(m, 0) <= now]
+            if STICKY[0] in ready and STICKY[1] > now:   # sticky success: the model that just worked goes first
+                ready.remove(STICKY[0])
+                ready.insert(0, STICKY[0])
         order = ready + [m for m in live if m not in ready]   # healthy models first
 
         for model in order:
