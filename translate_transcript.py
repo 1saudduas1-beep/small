@@ -15,6 +15,7 @@ Resilience:
       a short per-minute limit waits the server-provided retryDelay.
     * Truncated / blocked responses split the chunk instead of blind retries.
     * Results are id-matched (not just counted) and checked for untranslated text.
+    * Terms whose English was already given in parentheses are not repeated.
     * A global deadline stops the run and saves <prefix>_ar_partial.<ext>.
 
 Optional env vars:
@@ -310,7 +311,7 @@ TRANSLATE_SYSTEM = """You are a professional English-to-Arabic translator specia
 Rules:
 1. Translate into clear, natural Modern Standard Arabic (فصحى مبسطة) that reads as if originally written in Arabic, not word-for-word. Keep the speakers' tone (curiosity, humour, emphasis) and conversational fillers only when they carry meaning.
 2. Translate by MEANING and CONTEXT: segments are fragments of continuing sentences, so use the surrounding segments to resolve pronouns, ambiguity and idioms. Never translate idioms literally.
-3. Use established Arabic scientific/medical terminology. On a term's first appearance, put the English term in parentheses after the Arabic; afterwards use Arabic only. Follow the provided glossary exactly for consistency.
+3. Use established Arabic scientific/medical terminology. On a term's first appearance, put the English term in parentheses after the Arabic; afterwards use Arabic only. Terms listed under ALREADY INTRODUCED have had their English given earlier: use Arabic only for them. Follow the provided glossary exactly for consistency.
 4. Keep numbers, units, drug/anatomical names accurate. Keep proper nouns, brands and acronyms in Latin script when customary (e.g. CT, MRI).
 5. Input items are objects {"i": number, "en": text}. Output EXACTLY one object {"i": same number, "ar": Arabic translation} per input item, in the same order. Never merge, split, skip or add items. A short interjection ("Yeah.", "Right.") gets a short natural Arabic equivalent.
 6. Return only JSON: an array of {"i", "ar"} objects."""
@@ -332,6 +333,19 @@ def brief_text(brief):
         f"Domain: {brief.get('domain','')}\nSummary: {brief.get('summary','')}\n"
         f"Arabic tone: {brief.get('tone','')}\nGlossary:\n{gl}"
     )
+
+
+def introduced_terms(brief, translations):
+    """Glossary terms whose English already appears in parentheses in the output so far."""
+    done = "\n".join(t for t in translations if t)
+    if not done:
+        return []
+    found = []
+    for g in brief.get("glossary", []):
+        en = (g.get("en") or "").strip()
+        if en and re.search(r"\(\s*" + re.escape(en) + r"\s*\)", done, re.IGNORECASE):
+            found.append(en)
+    return found
 
 
 def validate_result(result, texts):
@@ -368,9 +382,12 @@ def translate_chunk(chain, api_key, brief, segments, translations, start, end, d
     ctx_next = "\n".join(segments[i]["text"] for i in after)
     texts = [segments[i]["text"] for i in range(start, end)]
     items = json.dumps([{"i": k + 1, "en": t} for k, t in enumerate(texts)], ensure_ascii=False)
+    introduced = ", ".join(introduced_terms(brief, translations))
 
     prompt = (
         f"{brief_text(brief)}\n\n"
+        f"ALREADY INTRODUCED (English already given in parentheses earlier; Arabic only from now on):\n"
+        f"{introduced or '(none)'}\n\n"
         f"PREVIOUS SEGMENTS (already translated, for continuity only):\n{ctx_prev or '(none)'}\n\n"
         f"UPCOMING SEGMENTS (context only, do NOT translate):\n{ctx_next or '(none)'}\n\n"
         f"TRANSLATE these {n} items. Return a JSON array of exactly {n} objects "
