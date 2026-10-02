@@ -21,6 +21,11 @@ How it works
      only, so it is never repeated and never forgotten.
   4. CHECKS (no API calls): number mismatch, possible omission/addition,
      leftover English, unmarked glossary terms, repeated phrases.
+  4b. FREE-TIER AWARE: a lite-model answer is never accepted while a quality model
+     can still answer. Unfinished batches are retried in rounds (pausing in between)
+     until the translation stage's share of the time budget is used; only then do
+     lite models answer, and those units are flagged, reviewed, and RE-TRANSLATED by a
+     quality model on the next run (the checkpoint is kept while anything is unfinished).
   5. REVIEW: suspect units are re-read by a stronger model (Pro first, then the
      quality chain). Units answered by a lite model (or kept in English) are ALWAYS
      reviewed, with no cap; a failed review batch is retried once and the reason
@@ -54,12 +59,14 @@ Environment variables
     GEMINI_LAST_RESORT_MODELS override the last-resort models
     GEMINI_THINKING_LEVEL    low (default, translation) | medium | high | off
                              (context pass and review always use high)
-    TRANSLATE_PARALLEL       parallel batches (default: min(4, number of keys))
+    TRANSLATE_PARALLEL       max parallel requests (default: min(3, number of keys));
+                             lowered automatically while models answer 503
     TRANSLATE_PROOFREAD      on (default) | off
     TRANSLATE_PROOF_BATCH    paragraphs per proofreading request (default 25)
     TRANSLATE_PROOF_LEVEL    thinking level of the proofreading pass (default medium)
-    TRANSLATE_MAX_MINUTES    global time budget (default 120)
-    TRANSLATE_REVIEW_MODEL   default gemini-3.1-pro-preview ; "off" disables review
+    TRANSLATE_MAX_MINUTES    global time budget (default 45; stages get fixed shares of it)
+    TRANSLATE_REVIEW_MODEL   default: the quality chain (pro-preview has no free-tier quota);
+                             set a model name to try it first ; "off" disables review
     TRANSLATE_REVIEW_MAX     max NON-lite suspect units reviewed (default 15);
                              lite / failed units are always reviewed
 
@@ -88,30 +95,34 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ------------------------------------------------------------------ tunables
 PARA_TARGET_WORDS = 110      # .txt: close a paragraph at a sentence end after this many words
 PARA_MAX_WORDS = 220         # .txt: hard cap
-CHUNK_WORDS = 1200           # .txt: English words per request
-CHUNK_MAX_UNITS = 12
+CHUNK_WORDS = 2600           # .txt: English words per request
+CHUNK_MAX_UNITS = 24
 SRT_CHUNK_CUES = 40
 CTX = {"txt": (2, 1), "srt": (6, 3)}   # (units before, units after) given as context
 
 DEFAULT_MODEL = "gemini-3.8-flash"
-QUALITY_CHAIN = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.7-flash"]
+QUALITY_CHAIN = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.5-flash"]
 LAST_RESORT = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
-DEFAULT_REVIEW_MODEL = "gemini-3.1-pro-preview"
+DEFAULT_REVIEW_MODEL = ""          # empty = use the quality chain (free tier has no pro quota)
 
 PER_MODEL_RETRIES = 4
 CHAIN_ROUNDS = 2
 ROUND_WAIT = 45
 COOLDOWN_SECS = 60
 MAX_SERVER_DELAY = 90
-REQUEST_TIMEOUT = 300
-DEFAULT_MAX_MINUTES = 120
+REQUEST_TIMEOUT = 420
+DEFAULT_MAX_MINUTES = 45
 QUALITY_PATIENCE = 240       # seconds spent on the quality chain per request
 SHORT_PATIENCE = 45          # after 2 consecutive degradations
-REVIEW_BATCH = 6
+REVIEW_BATCH = 10
 OVERLOAD_HTTP = {503}        # model overloaded: fail over at once, never rotate keys
 DEMOTE_AFTER = 2             # consecutive failures before a model is demoted
 DEMOTE_SECS = 600            # a demoted model is tried last for this long
-PROOF_BATCH = 25
+PROOF_BATCH = 40
+CONTEXT_PATIENCE = 420
+RETRY_PAUSE = (45, 75)       # seconds to pause between translation rounds when models are busy
+# share of the time budget at which each stage must be finished
+STAGE_FRAC = {"context": 0.20, "context_lite": 0.30, "translate": 0.55, "lite": 0.65, "review": 0.82, "proof": 0.95}
 CONTEXT_CAP_CHARS = 600_000
 
 RETRYABLE_HTTP = {429, 500, 502, 503, 504}
@@ -146,6 +157,58 @@ DEMOTED = {}             # model -> unix time until which it is tried last
 MODEL_FAILS = Counter()  # consecutive failures per model
 WAIT = [0.0]             # seconds spent sleeping (summed over threads)
 TIMINGS = []             # (stage, seconds, requests)
+STAGE_END = [float("inf")]
+START = [0.0]
+PAUSE_UNTIL = [0.0]      # shared pause: every worker waits (no thundering herd after 503s)
+ERRS = Counter()         # (model, http code) -> count
+
+
+class Gate:
+    """Adaptive concurrency: lowered while models answer 503, restored after successes."""
+    def __init__(self):
+        self.cv = threading.Condition()
+        self.limit = self.max = 1
+        self.active = self.ok = 0
+        self.last_cut = 0.0
+
+    def setup(self, n):
+        self.limit = self.max = max(1, n)
+
+    def acquire(self, stop_at):
+        with self.cv:
+            while self.active >= self.limit:
+                _guard(stop_at)
+                self.cv.wait(1.0)
+            self.active += 1
+
+    def release(self):
+        with self.cv:
+            self.active -= 1
+            self.cv.notify_all()
+
+    def overload(self):
+        with self.cv:
+            now = time.time()
+            self.ok = 0
+            if self.limit > 1 and now - self.last_cut >= 15:
+                self.limit -= 1
+                self.last_cut = now
+                print(f"  concurrency lowered to {self.limit}")
+
+    def success(self):
+        with self.cv:
+            self.ok += 1
+            if self.ok >= 4 and self.limit < self.max:
+                self.limit += 1
+                self.ok = 0
+                self.cv.notify_all()
+
+
+GATE = Gate()
+
+
+def set_stage_end(key):
+    STAGE_END[0] = min(DEADLINE[0], START[0] + STAGE_FRAC[key] * (DEADLINE[0] - START[0]))
 
 
 class Stage:
@@ -210,6 +273,10 @@ class ApiUnavailable(Exception):
     def __init__(self, msg, fatal=False):
         super().__init__(msg)
         self.fatal = fatal
+
+
+class StageTimeUp(ApiUnavailable):
+    """The current stage used up its share of the time budget."""
 
 
 class ResponseRejected(Exception):
@@ -352,6 +419,8 @@ def _guard(stop_at):
     now = time.time()
     if now > DEADLINE[0]:
         raise ApiUnavailable("global time budget reached", fatal=True)
+    if now > STAGE_END[0]:
+        raise StageTimeUp("stage time budget reached", fatal=True)
     if now >= stop_at:
         raise ApiUnavailable("patience exhausted")
 
@@ -378,6 +447,27 @@ def _retry_delay(raw):
     m = (re.search(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', raw)
          or re.search(r"retry in (\d+(?:\.\d+)?)s", raw))
     return float(m.group(1)) if m else None
+
+
+def _wait_pause(stop_at):
+    while True:
+        left = PAUSE_UNTIL[0] - time.time()
+        if left <= 0:
+            return
+        _sleep(min(left, 5), stop_at)
+
+
+def chain_alive(chain):
+    """False when every (key, model) pair of the chain has no quota left (or the model is gone)."""
+    return any(m not in DEAD_MODELS and any(_key_ok(k, m) for k in range(len(KEYS))) for m in chain)
+
+
+def _gated_post(model, key, body, stop_at):
+    GATE.acquire(stop_at)
+    try:
+        return _post(model, key, body)
+    finally:
+        GATE.release()
 
 
 def _key_ok(k, model):
@@ -430,19 +520,23 @@ def call_gemini(chain, system, user, schema=None, level="default", patience=None
             overloaded = False
             for attempt in range(1, PER_MODEL_RETRIES + 1):
                 _guard(stop_at)
+                _wait_pause(stop_at)
                 ki = _pick_key(model, stop_at)
                 if ki is None:
                     break
                 body = _build_body(system, user, schema, level if use_thinking else None)
                 try:
-                    text = _post(model, KEYS[ki], body)
+                    text = _gated_post(model, KEYS[ki], body, stop_at)
                     note_success(model)
+                    GATE.success()
                     return text, model
                 except ResponseRejected:
                     raise
                 except urllib.error.HTTPError as e:
                     raw = e.read().decode("utf-8", "ignore")
                     last_err = f"{model} (key #{ki + 1}) HTTP {e.code}: {raw[:160]}"
+                    with LOCK:
+                        ERRS[(model, e.code)] += 1
                     if e.code in (401, 403):
                         BAD_KEYS.add(ki)
                         print(f"  key #{ki + 1} rejected (HTTP {e.code}) -> not used again")
@@ -460,6 +554,7 @@ def call_gemini(chain, system, user, schema=None, level="default", patience=None
                         continue
                     if e.code in OVERLOAD_HTTP:
                         note_failure(model)
+                        GATE.overload()
                         overloaded = True
                         print(f"  {model} overloaded (HTTP {e.code}) -> next model (keys are not rotated)")
                         break
@@ -493,10 +588,19 @@ def call_gemini(chain, system, user, schema=None, level="default", patience=None
         if rnd < CHAIN_ROUNDS:
             wait = ROUND_WAIT + random.uniform(0, 15)
             print(f"  all models failed (round {rnd}/{CHAIN_ROUNDS}); waiting {wait:.0f}s")
-            _sleep(wait, stop_at)
+            with LOCK:
+                PAUSE_UNTIL[0] = max(PAUSE_UNTIL[0], time.time() + wait)
+            _wait_pause(stop_at)
             MODEL_COOL.clear()
 
     raise ApiUnavailable(f"all models failed: {last_err}")
+
+
+def call_quality(primary, system, user, schema=None, level="default"):
+    """Quality chain only (no lite fallback). Returns (text, model, False)."""
+    text, model = call_gemini(build_chain(primary), system, user, schema, level, QUALITY_PATIENCE)
+    QUALITY_FAILS[0] = 0
+    return text, model, False
 
 
 def call_tiered(primary, system, user, schema=None, level="default"):
@@ -528,6 +632,45 @@ def strip_markup(text):
     text = MARK_RE.sub(lambda m: m.group(1), text)
     text = STRAY_RE.sub(lambda m: m.group(1).split("|")[0], text)
     return text.replace("⟦", "").replace("⟧", "")
+
+
+def fix_marks(raw):
+    """Repair reversed markup: ⟦English|عربي⟧ -> ⟦عربي|English⟧."""
+    def swap(m):
+        a, b = m.group(1), m.group(2)
+        if LATIN_RE.search(a) and not ARABIC_RE.search(a) and ARABIC_RE.search(b) and not LATIN_RE.search(b):
+            return f"⟦{b.strip()}|{a.strip()}⟧"
+        return m.group(0)
+    return MARK_RE.sub(swap, raw)
+
+
+def swap_known_english(job, raw):
+    """English glossary terms left unmarked/untranslated in the Arabic -> ⟦glossary Arabic|English⟧."""
+    if not LATIN_RE.search(raw):
+        return raw
+    kw = keep_words(job)
+    with job.lock:
+        pairs = list(job.gloss.values())
+    table = {en.lower(): (en, ar) for en, ar in pairs
+             if len(en) >= 4 and ARABIC_RE.search(ar) and not LATIN_RE.search(ar)
+             and en.lower() not in kw and en.lower() != ar.lower()}
+    if not table:
+        return raw
+    pat = re.compile(r"(?<![A-Za-z])(" + "|".join(re.escape(k) for k in sorted(table, key=len, reverse=True))
+                     + r")(?![A-Za-z])", re.I)
+
+    def repl(m):
+        en, ar = table[m.group(1).lower()]
+        before = m.string[m.start() - 1] if m.start() > 0 else ""
+        if before == "ل" and ar.startswith("ال"):
+            ar = ar[1:]
+        return f"⟦{ar}|{en}⟧"
+
+    parts = re.split(r"(⟦[^⟧]*⟧|\([^)]*\))", raw)
+    for k in range(0, len(parts), 2):
+        if LATIN_RE.search(parts[k]):
+            parts[k] = pat.sub(repl, parts[k])
+    return "".join(parts)
 
 
 def render_text(text, seen):
@@ -566,6 +709,8 @@ class Job:
         self.brief = {"domain": "", "summary": "", "tone": "", "glossary": [], "asr_corrections": [],
                       "keep_english": []}
         self.lock = threading.RLock()
+        self.lite_ok = False          # lite models may answer (last-resort pass only)
+        self.proofed = set()          # unit ids already proofread
         self.autotag_log = []
         self.proof_log = []
         self.proof_stats = {"applied": 0, "rejected": 0, "failed_batches": 0}
@@ -659,7 +804,15 @@ def build_brief(job):
         f"TRANSCRIPT:\n{sample_for_context(job.units)}"
     )
     try:
-        text, _, _ = call_tiered(job.primary, CONTEXT_SYSTEM, prompt, CONTEXT_SCHEMA, level="high")
+        try:
+            text, _ = call_gemini(build_chain(job.primary), CONTEXT_SYSTEM, prompt, CONTEXT_SCHEMA,
+                                  level="high", patience=CONTEXT_PATIENCE)
+        except ApiUnavailable as e:
+            if e.fatal and not isinstance(e, StageTimeUp):
+                raise
+            print("  quality models unavailable for the context pass -> using lite models (weaker glossary)")
+            set_stage_end("context_lite")
+            text, _, _ = call_tiered(job.primary, CONTEXT_SYSTEM, prompt, CONTEXT_SCHEMA, level="high")
         brief = clean_json(text)
         for k, v in (("domain", ""), ("summary", ""), ("tone", ""), ("glossary", []), ("asr_corrections", []),
                      ("keep_english", [])):
@@ -794,7 +947,10 @@ def translate_batch(job, batch):
             f'{{"i", "ar"}} using the same i values:\nITEMS:\n{items}'
         )
         try:
-            text, model, degraded = call_tiered(job.primary, system, prompt, CHUNK_SCHEMA)
+            if job.lite_ok:
+                text, model, degraded = call_tiered(job.primary, system, prompt, CHUNK_SCHEMA)
+            else:
+                text, model, degraded = call_quality(job.primary, system, prompt, CHUNK_SCHEMA)
             result = clean_json(text)
         except (SystemExit, ApiUnavailable):
             raise
@@ -807,7 +963,11 @@ def translate_batch(job, batch):
 
         got, problems = parse_items(result, pending)
         for i, ar in got.items():
+            ar = swap_known_english(job, fix_marks(ar))
             job.ar[i - 1] = ar
+            job.kept_en[i - 1] = False
+            job.reviewed.pop(i, None)
+            job.proofed.discard(i)
             job.deg[i - 1] = degraded
             job.model[i - 1] = model
             job.learn_terms(ar)
@@ -828,11 +988,13 @@ def translate_batch(job, batch):
     translate_batch(job, pending[mid:])
 
 
-def plan_chunks(job):
+def plan_chunks(job, redo_lite=False):
+    """Units still to translate (and, with redo_lite, those that only have a lite/English draft)."""
     chunks, cur, words = [], [], 0
     limit_units = SRT_CHUNK_CUES if job.kind == "srt" else CHUNK_MAX_UNITS
     for u in job.units:
-        if job.ar[u["id"] - 1] is not None:
+        k = u["id"] - 1
+        if job.ar[k] is not None and not (redo_lite and (job.deg[k] or job.kept_en[k])):
             continue
         cur.append(u)
         words += u["words"]
@@ -892,6 +1054,8 @@ def keep_words(job):
 def check_unit(job, u):
     """Deterministic quality flags for one unit (no API calls)."""
     i = u["id"] - 1
+    if job.ar[i] is None:
+        return ["not translated"]
     raw = job.ar[i] or ""
     plain = strip_markup(raw)
     en = u["en"]
@@ -977,6 +1141,8 @@ def review_pass(job):
         cap = 15
     suspects = []
     for u in job.units:
+        if job.ar[u["id"] - 1] is None or u["id"] in job.reviewed:
+            continue
         reasons = check_unit(job, u)
         if reasons:
             suspects.append((u, reasons))
@@ -990,7 +1156,7 @@ def review_pass(job):
           f"({len(must)} lite/failed always, up to {cap} others).")
     if len(others) > cap:
         job.review_log.append(f"{len(others) - cap} lower-priority suspect unit(s) not reviewed (cap {cap})")
-    chain = [rm] + [m for m in build_chain(job.primary) if m != rm]
+    chain = ([rm] if rm else []) + [m for m in build_chain(job.primary) if m != rm]
     parts = [chosen[k:k + REVIEW_BATCH] for k in range(0, len(chosen), REVIEW_BATCH)]
     stopped = []
 
@@ -1005,6 +1171,7 @@ def review_pass(job):
             return
         got, problems, model = val
         for i, ar in got.items():
+            ar = swap_known_english(job, fix_marks(ar))
             old = job.ar[i - 1]
             changed = strip_markup(ar) != strip_markup(old)
             job.ar[i - 1] = ar
@@ -1089,7 +1256,8 @@ def proofread_pass(job):
         size = PROOF_BATCH
     lvl = os.environ.get("TRANSLATE_PROOF_LEVEL", "medium").strip().lower()
     level = None if lvl in ("", "off", "none") else lvl
-    todo = [u for u in job.units if job.ar[u["id"] - 1] and not job.kept_en[u["id"] - 1]]
+    todo = [u for u in job.units if job.ar[u["id"] - 1] and not job.kept_en[u["id"] - 1]
+            and u["id"] not in job.proofed]
     batches = [todo[k:k + size] for k in range(0, len(todo), size)]
     chain = build_chain(job.primary)
     print(f"Proofreading {len(todo)} paragraph(s) in {len(batches)} request(s)...")
@@ -1103,6 +1271,7 @@ def proofread_pass(job):
             print(f"  proofreading batch {ids[0]}-{ids[-1]} skipped: {str(val)[:100]}")
             return
         corrections, _model = val
+        job.proofed.update(ids)
         for c in corrections:
             if not isinstance(c, dict) or not isinstance(c.get("i"), int) or c["i"] not in ids:
                 stats["rejected"] += 1
@@ -1196,7 +1365,12 @@ def write_report(path, job, started):
     lines += ["", f"== Auto-tagged terms (English added by the program): {len(job.autotag_log)} =="] \
         + (job.autotag_log or ["(none)"])
     lines += ["", "== Timing =="] + [f"{n}: {d / 60:.1f} min, {r} request(s)" for n, d, r in TIMINGS]
-    lines += [f"time spent waiting/back-off (summed over threads): {WAIT[0] / 60:.1f} min"]
+    lines += [f"time spent waiting/back-off (summed over threads): {WAIT[0] / 60:.1f} min",
+              "HTTP errors per model: " + (", ".join(f"{m} HTTP {c}: {n}" for (m, c), n in sorted(ERRS.items()))
+                                           or "none")]
+    redo = [u["id"] for u in job.units if job.ar[u["id"] - 1] is None or job.deg[u["id"] - 1]
+            or job.kept_en[u["id"] - 1]]
+    lines += ["", f"== Units to redo on the next run (lite / English / untranslated): {len(redo)} ==", str(redo)]
     lines += ["", f"== Final glossary ({len(job.gloss)} terms) =="]
     lines += [f"{en} = {ar}" for en, ar in job.gloss.values()]
     with open(path, "w", encoding="utf-8") as f:
@@ -1208,7 +1382,8 @@ def save_progress(path, job):
         data = {
             "fingerprint": job.fingerprint(), "brief": job.brief, "gloss": dict(job.gloss),
             "core": sorted(job.core), "ar": list(job.ar), "deg": list(job.deg), "model": list(job.model),
-            "kept_en": list(job.kept_en),
+            "kept_en": list(job.kept_en), "reviewed": {str(k): v for k, v in job.reviewed.items()},
+            "proofed": sorted(job.proofed),
         }
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -1231,6 +1406,8 @@ def load_progress(path, job):
         job.core = set(data["core"])
         job.ar, job.deg = data["ar"], data["deg"]
         job.model, job.kept_en = data["model"], data["kept_en"]
+        job.reviewed = {int(k): v for k, v in data.get("reviewed", {}).items()}
+        job.proofed = set(data.get("proofed", []))
         done = sum(1 for a in job.ar if a is not None)
         print(f"Resuming from checkpoint: {done}/{len(job.units)} units already translated.")
         return True
@@ -1264,7 +1441,8 @@ def main():
         minutes = float(os.environ.get("TRANSLATE_MAX_MINUTES", DEFAULT_MAX_MINUTES))
     except ValueError:
         minutes = DEFAULT_MAX_MINUTES
-    DEADLINE[0] = time.time() + minutes * 60
+    START[0] = time.time()
+    DEADLINE[0] = START[0] + minutes * 60
 
     ext = os.path.splitext(input_path)[1] or ".txt"
     segments = parse_transcript(input_path)
@@ -1278,20 +1456,22 @@ def main():
             job.ar[u["id"] - 1] = ""
     words = sum(u["words"] for u in units)
     try:
-        PARALLEL[0] = max(1, min(8, int(os.environ.get("TRANSLATE_PARALLEL", min(4, len(KEYS))))))
+        PARALLEL[0] = max(1, min(8, int(os.environ.get("TRANSLATE_PARALLEL", min(3, len(KEYS))))))
     except ValueError:
-        PARALLEL[0] = max(1, min(4, len(KEYS)))
+        PARALLEL[0] = max(1, min(3, len(KEYS)))
     print(f"Parsed {len(segments)} segments -> {len(units)} {'cues' if kind == 'srt' else 'paragraphs'} "
           f"({words} words). Keys: {len(KEYS)} | quality chain: {' -> '.join(build_chain(model))} "
           f"| last resort: {' -> '.join(last_resort_chain())} | thinking: {get_thinking_level() or 'default'} "
           f"| budget: {minutes:.0f} min | parallel: {PARALLEL[0]}")
 
+    GATE.setup(PARALLEL[0])
     progress_path = f"{prefix}_progress.json"
     resumed = load_progress(progress_path, job)
 
     try:
         if not (resumed and job.brief.get("domain")):
             with Stage("context pass"):
+                set_stage_end("context")
                 print("Building context brief + glossary + mishearing list...")
                 job.brief = build_brief(job)
                 job.add_brief_glossary()
@@ -1300,24 +1480,73 @@ def main():
               f"| keep-in-English: {len(job.brief.get('keep_english', []))}")
         save_progress(progress_path, job)
 
-        chunks = list(enumerate(plan_chunks(job), 1))
-        total = len(chunks)
+        def run_translation(label, redo_lite, on_fail_continue):
+            rnd = 0
+            while True:
+                chunks = plan_chunks(job, redo_lite=redo_lite)
+                if not chunks:
+                    return
+                if time.time() >= STAGE_END[0]:
+                    print(f"  {label}: stage time is up with {sum(len(c) for c in chunks)} unit(s) pending")
+                    return
+                if not job.lite_ok and not chain_alive(build_chain(model)):
+                    print("  every quality model has used its daily quota on every key "
+                          "(free-tier quotas reset at midnight Pacific time) -> stopping this stage")
+                    return
+                rnd += 1
+                items = list(enumerate(chunks, 1))
+                print(f"{label} round {rnd}: {len(items)} batch(es), {sum(len(c) for c in chunks)} unit(s) pending")
 
-        def tr(item):
-            n, chunk = item
-            print(f"Translating batch {n}/{total} (units {chunk[0]['id']}-{chunk[-1]['id']} / {len(units)})...")
-            translate_batch(job, chunk)
+                def tr(item):
+                    n, chunk = item
+                    print(f"Translating batch {n}/{len(items)} (units {chunk[0]['id']}-{chunk[-1]['id']} "
+                          f"/ {len(units)})...")
+                    translate_batch(job, chunk)
 
-        def tr_done(item, ok, val):
-            if not ok:
-                raise val
-            save_progress(progress_path, job)
+                def tr_done(item, ok, val):
+                    if ok:
+                        save_progress(progress_path, job)
+                        return
+                    if isinstance(val, StageTimeUp):
+                        return
+                    if isinstance(val, ApiUnavailable) and not val.fatal:
+                        print(f"  batch {item[0]} not finished: {str(val)[:100]}")
+                        save_progress(progress_path, job)
+                        return
+                    raise val
 
-        with Stage("translation"):
-            run_parallel(tr, chunks, min(PARALLEL[0], max(1, total)), tr_done)
+                run_parallel(tr, items, min(PARALLEL[0], len(items)), tr_done)
+                if not plan_chunks(job, redo_lite=redo_lite) or on_fail_continue:
+                    return
+                left = STAGE_END[0] - time.time()
+                if left <= 1:
+                    continue
+                wait = min(random.uniform(*RETRY_PAUSE), left)
+                print(f"  quality models are busy; pausing {wait:.0f}s, then retrying the unfinished batches")
+                with LOCK:
+                    PAUSE_UNTIL[0] = max(PAUSE_UNTIL[0], time.time() + wait)
+                try:
+                    _wait_pause(STAGE_END[0])
+                except ApiUnavailable:
+                    pass
+
+        with Stage("translation (quality models only)"):
+            set_stage_end("translate")
+            run_translation("Translation", True, False)
+
+        if plan_chunks(job, redo_lite=False):
+            with Stage("translation (lite last resort)"):
+                set_stage_end("lite")
+                job.lite_ok = True
+                QUALITY_FAILS[0] = 2
+                run_translation("Last-resort", False, True)
+            job.lite_ok = False
+
         with Stage("review"):
+            set_stage_end("review")
             review_pass(job)
         with Stage("proofreading"):
+            set_stage_end("proof")
             proofread_pass(job)
     except ApiUnavailable as e:
         done = sum(1 for a in job.ar if a is not None)
@@ -1342,10 +1571,18 @@ def main():
         print(f"Wrote {p}")
     write_report(f"{prefix}_report.txt", job, started)
     print(f"Wrote {prefix}_report.txt")
-    try:
-        os.remove(progress_path)
-    except OSError:
-        pass
+    incomplete = any(a is None for a in job.ar) or any(job.deg) or any(job.kept_en)
+    if incomplete:
+        save_progress(progress_path, job)
+        n = sum(1 for k in range(len(units)) if job.ar[k] is None or job.deg[k] or job.kept_en[k])
+        print(f"INCOMPLETE: {n} unit(s) are untranslated or came from a lite model (listed in the report). "
+              f"Checkpoint kept: {progress_path} - commit it and run again after the daily quota resets "
+              f"(midnight Pacific time); only those units will be redone.")
+    else:
+        try:
+            os.remove(progress_path)
+        except OSError:
+            pass
 
     summary = ", ".join(f"{m}: {c}" for m, c in USED.most_common())
     print(f"Requests per model -> {summary}")
