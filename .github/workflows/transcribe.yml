@@ -5,6 +5,9 @@ name: Transcribe Audio
 # download_youtube_audio.py, translate_transcript.py) live at the repository root.
 #
 # Sources: a NotebookLM Audio Overview share link OR a single YouTube video link.
+# v9 (free tier, <= 30 min): streaming + short first-token timeouts, per-model circuit
+# breaker, hedged requests while congested, merged review+proofreading pass, enforced glossary.
+# Tip: 503 peaks roughly 9:00-18:00 Pacific time; running outside those hours is faster.
 # Optional secrets: GEMINI_API_KEY (translation; GEMINI_API_KEY_2 ... _5 are
 # optional extra keys that are rotated automatically - create each one in a
 # DIFFERENT Google Cloud project, free-tier quotas are per project, not per key),
@@ -85,9 +88,9 @@ on:
           - gemini-3.7-flash
           - gemini-3.5-flash
       translate_max_minutes:
-        description: 'Translation time budget in minutes (global budget inside the script)'
+        description: 'Translation time budget in minutes, 10-200 (set it higher for long audio; the step timeout follows it automatically)'
         required: false
-        default: '60'
+        default: '30'
         type: string
 
 # Least privilege: this workflow only needs to read the repository.
@@ -164,6 +167,16 @@ jobs:
           KEY="$(printf '%s' "$CLEAN_URL" | sha1sum | cut -c1-16)"
           echo "TCACHE=transcribe-link-$KEY" >> "$GITHUB_ENV"
           echo "FMT=$OUTPUT_FORMAT" >> "$GITHUB_ENV"
+
+      - name: Validate translation time budget
+        env:
+          BUDGET: ${{ github.event.inputs.translate_max_minutes }}
+        run: |
+          if [[ ! "${BUDGET:-30}" =~ ^[0-9]+$ ]] || (( ${BUDGET:-30} < 10 || ${BUDGET:-30} > 200 )); then
+            echo "::error::translate_max_minutes must be a whole number between 10 and 200."
+            exit 1
+          fi
+          echo "Translation budget: ${BUDGET:-30} minutes"
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -333,7 +346,8 @@ jobs:
 
       - name: Translate to Arabic with Gemini
         if: ${{ github.event.inputs.translate == 'true' }}
-        timeout-minutes: 150
+        # Follows the chosen budget (+20 min margin for saving partial output / checkpoint).
+        timeout-minutes: ${{ fromJSON(github.event.inputs.translate_max_minutes || '30') + 20 }}
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           # Optional extra keys (empty secrets are ignored by the script).
@@ -343,17 +357,19 @@ jobs:
           GEMINI_API_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
           # Global time budget inside the script (stages get fixed shares of it).
           TRANSLATE_MAX_MINUTES: ${{ github.event.inputs.translate_max_minutes }}
-          # Optional: low (default) | medium | high | off
+          # Translation thinking: low (default) | medium | high | off
           # GEMINI_THINKING_LEVEL: low
+          # Context pass thinking (one request on a bounded sample): medium (default)
+          # CONTEXT_THINKING: medium
           # Optional: max parallel requests (default min(3, number of keys))
-          # TRANSLATE_PARALLEL: '3'
+          # TRANSLATE_PARALLEL: '4'   (default 4; lowered automatically on 503, restored after successes)
           # Optional: override the quality chain (comma-separated). Lite models are
           # a last resort only (GEMINI_LAST_RESORT_MODELS) and their output is reviewed.
           # GEMINI_FALLBACK_MODELS: gemini-3.6-flash,gemini-3.7-flash
           # Optional: review model for suspect paragraphs (default = quality chain;
           # "off" disables) and the cap for non-lite suspects
           # TRANSLATE_REVIEW_MODEL: off
-          # TRANSLATE_REVIEW_MAX: '15'
+          # TRANSLATE_REVIEW_MAX: '30'  (suspect units sent to the merged MQM review; the rest are proofread)
           # Optional: Gemma 4 middle tier (used when Flash fails twice; always reviewed by Flash)
           # TRANSLATE_GEMMA: off
           # GEMMA_MODELS: gemma-4-31b-it,gemma-4-26b-a4b-it
@@ -389,7 +405,7 @@ jobs:
         run: |
           REPORT="${SAFE_NAME}_report.txt"
           [[ -f "$REPORT" ]] || exit 0
-          N="$(grep -oP '== وحدات تُعاد في التشغيل القادم[^:]*: \K[0-9]+' "$REPORT" || echo 0)"
+          N="$(grep -oP '== Units to redo on the next run[^:]*: \K[0-9]+' "$REPORT" || echo 0)"
           if [[ "${N:-0}" -gt 0 ]]; then
             echo "::warning::$N paragraph(s) are untranslated or came from a lite/Gemma model and were not reviewed. Run this workflow again with the SAME link after the Gemini daily quota resets (midnight Pacific time); only those paragraphs are redone."
             echo "### Translation incomplete: $N paragraph(s) pending - re-run with the same link after the quota reset." >> "$GITHUB_STEP_SUMMARY"
