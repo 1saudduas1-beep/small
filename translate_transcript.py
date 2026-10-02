@@ -45,6 +45,16 @@ Resilience
       every unit they touch is sent to review.
     * Sticky success: the model that answered last is tried first for STICKY_SECS
       (5 min) while it stays healthy; a failure of that model cancels the priority.
+    * GEMMA 4 (middle tier, between Flash and lite): when the whole Flash chain fails twice in a
+      row (2 rounds, ~2-3 min), the pending paragraphs go to gemma-4-31b-it -> gemma-4-26b-a4b-it
+      in SMALL batches (~900 words, glossary filtered to the terms present in the batch) so the
+      16K tokens/minute limit is respected (per-key sliding-window limiter). While Flash keeps
+      failing, new batches try Gemma first for GEMMA_PREFER_SECS and Flash is probed again
+      afterwards. Every Gemma paragraph is ALWAYS reviewed by Flash (no cap); if the review
+      cannot run it stays flagged and is re-translated by Flash on the next run.
+      Gemma capabilities are auto-calibrated: thinking low/medium -> minimal (high stays high),
+      and on HTTP 400 the request degrades step by step (thinking, JSON schema, JSON mime,
+      systemInstruction) - JSON is then enforced through the prompt and parsed leniently.
     * Batches are translated in parallel (TRANSLATE_PARALLEL workers, one key each
       at a time). The previous paragraphs given as context are then the English
       source (consistency comes from the glossary and the marked terms).
@@ -61,12 +71,16 @@ Environment variables
     GEMINI_LAST_RESORT_MODELS override the last-resort models
     GEMINI_THINKING_LEVEL    low (default, translation) | medium | high | off
                              (context pass and review always use high)
+    GEMMA_MODELS             override the Gemma tier (comma-separated; default gemma-4-31b-it,
+                             gemma-4-26b-a4b-it)
+    TRANSLATE_GEMMA          on (default) | off   (Gemma middle tier)
+    TRANSLATE_GEMMA_WORDS    English words per Gemma request (default 900)
     TRANSLATE_PARALLEL       max parallel requests (default: min(3, number of keys));
                              lowered automatically while models answer 503
     TRANSLATE_PROOFREAD      on (default) | off
     TRANSLATE_PROOF_BATCH    paragraphs per proofreading request (default 25)
     TRANSLATE_PROOF_LEVEL    thinking level of the proofreading pass (default medium)
-    TRANSLATE_MAX_MINUTES    global time budget (default 45; stages get fixed shares of it)
+    TRANSLATE_MAX_MINUTES    global time budget (default 60; stages get fixed shares of it)
     TRANSLATE_REVIEW_MODEL   default: the quality chain (pro-preview has no free-tier quota);
                              set a model name to try it first ; "off" disables review
     TRANSLATE_REVIEW_MAX     max NON-lite suspect units reviewed (default 15);
@@ -113,7 +127,7 @@ ROUND_WAIT = 45
 COOLDOWN_SECS = 60
 MAX_SERVER_DELAY = 90
 REQUEST_TIMEOUT = 420
-DEFAULT_MAX_MINUTES = 45
+DEFAULT_MAX_MINUTES = 60
 QUALITY_PATIENCE = 240       # seconds spent on the quality chain per request
 SHORT_PATIENCE = 45          # after 2 consecutive degradations
 REVIEW_BATCH = 10
@@ -122,6 +136,13 @@ DEMOTE_AFTER = 2             # consecutive failures before a model is demoted
 DEMOTE_SECS = 600            # a demoted model is tried last for this long
 STICKY_SECS = 300            # the model that just succeeded is tried FIRST for this long
 PROOF_BATCH = 40
+GEMMA = ["gemma-4-31b-it", "gemma-4-26b-a4b-it"]
+GEMMA_WORDS = 900            # English words per Gemma request (16K tokens/min limit)
+GEMMA_MAX_UNITS = {"txt": 8, "srt": 30}
+GEMMA_TPM = 14_000           # input tokens per minute per key (limit 16K, safety margin)
+GEMMA_RPM = 26               # requests per minute per key (limit 30)
+GEMMA_PATIENCE = 150         # seconds per Gemma request (all Gemma models)
+GEMMA_PREFER_SECS = 240      # after a Flash failure new batches try Gemma first for this long
 CONTEXT_PATIENCE = 420
 RETRY_PAUSE = (45, 75)       # seconds to pause between translation rounds when models are busy
 # share of the time budget at which each stage must be finished
@@ -165,6 +186,14 @@ STAGE_END = [float("inf")]
 START = [0.0]
 PAUSE_UNTIL = [0.0]      # shared pause: every worker waits (no thundering herd after 503s)
 ERRS = Counter()         # (model, http code) -> count
+NO_SCHEMA = set()        # models that rejected responseSchema
+NO_MIME = set()          # models that rejected responseMimeType
+NO_SYSTEM = set()        # models that rejected systemInstruction
+QUIRK_LOG = []           # capability fallbacks discovered at run time (for the report)
+GEMMA_PREFER = [0.0]     # unix time until which new batches try Gemma before Flash
+GEMMA_PROBING = [False]  # True once Flash has failed: Flash is then probed with a single round
+GEMMA_WIN = {}           # key index -> [(time, tokens)] sliding window for the Gemma limits
+PROGRESS_PATH = [None]
 
 
 class Gate:
@@ -257,6 +286,52 @@ def run_parallel(fn, items, workers, on_done):
     ex.shutdown(wait=True)
 
 
+def is_gemma(model):
+    return str(model).startswith("gemma")
+
+
+def gemma_chain():
+    return env_list("GEMMA_MODELS", GEMMA)
+
+
+def gemma_allowed():
+    if os.environ.get("TRANSLATE_GEMMA", "on").strip().lower() in ("off", "none", "0"):
+        return False
+    return chain_alive(gemma_chain())
+
+
+def _gemma_throttle(ki, tokens, stop_at):
+    """Per-key sliding window for Gemma (tokens and requests per minute); reserves capacity."""
+    while True:
+        with LOCK:
+            now = time.time()
+            win = GEMMA_WIN.setdefault(ki, [])
+            win[:] = [(t, n) for t, n in win if now - t < 60]
+            if not win or (sum(n for _, n in win) + tokens <= GEMMA_TPM and len(win) < GEMMA_RPM):
+                win.append((now, tokens))
+                return
+            wait = win[0][0] + 60 - now
+        _sleep(min(max(wait, 0.5) + 0.3, 8), stop_at)
+
+
+def _degrade_quirk(model, raw, thinking_on, schema):
+    """HTTP 400: switch off one unsupported feature. Non-Gemma models only lose thinking."""
+    low = raw.lower()
+    order = ["thinking", "schema", "mime", "system"]
+    sets = {"thinking": NO_THINKING, "schema": NO_SCHEMA, "mime": NO_MIME, "system": NO_SYSTEM}
+    active = {"thinking": thinking_on, "schema": bool(schema) and model not in NO_SCHEMA,
+              "mime": model not in NO_MIME, "system": model not in NO_SYSTEM}
+    hints = {"thinking": ("thinking", "thought"), "schema": ("schema",),
+             "mime": ("mime", "json mode"), "system": ("system", "developer instruction")}
+    cand = [k for k in order if active[k] and (is_gemma(model) or k == "thinking")]
+    pick = next((k for k in cand if any(h in low for h in hints[k])), cand[0] if cand else None)
+    if pick is None:
+        return None
+    sets[pick].add(model)
+    QUIRK_LOG.append(f"{model}: تم رفض '{pick}' (HTTP 400) -> مُعطَّل لهذا النموذج")
+    return pick
+
+
 def note_failure(model):
     with LOCK:
         MODEL_FAILS[model] += 1
@@ -273,7 +348,8 @@ def note_success(model):
         USED[model] += 1
         MODEL_FAILS[model] = 0
         DEMOTED.pop(model, None)
-        STICKY[0], STICKY[1] = model, time.time() + STICKY_SECS
+        if not is_gemma(model):
+            STICKY[0], STICKY[1] = model, time.time() + STICKY_SECS
 
 
 class ApiUnavailable(Exception):
@@ -379,16 +455,27 @@ def build_units(segments, kind):
 
 
 # ---------------------------------------------------------------- gemini
-def _build_body(system, user, schema, thinking):
-    body = {
-        "systemInstruction": {"parts": [{"text": system}]},
-        "contents": [{"role": "user", "parts": [{"text": user}]}],
-        "generationConfig": {"responseMimeType": "application/json"},
-    }
-    if schema:
-        body["generationConfig"]["responseSchema"] = schema
+def _build_body(system, user, schema, thinking, model=""):
+    gem = is_gemma(model)
+    if gem and thinking:                       # Gemma 4: thinking is on/off only (high | minimal)
+        thinking = "high" if thinking == "high" else "minimal"
+    if schema and (gem or model in NO_SCHEMA):  # JSON also enforced through the prompt
+        user = (user + "\n\nOUTPUT FORMAT: respond with ONLY valid JSON (no markdown fences, no commentary) "
+                "matching this JSON schema:\n" + json.dumps(schema, ensure_ascii=False))
+    gen = {}
+    if model not in NO_MIME:
+        gen["responseMimeType"] = "application/json"
+    if schema and model not in NO_SCHEMA:
+        gen["responseSchema"] = schema
     if thinking:
-        body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": thinking}
+        gen["thinkingConfig"] = {"thinkingLevel": thinking}
+    if model in NO_SYSTEM:
+        body = {"contents": [{"role": "user", "parts": [{"text": system + "\n\n" + user}]}]}
+    else:
+        body = {"systemInstruction": {"parts": [{"text": system}]},
+                "contents": [{"role": "user", "parts": [{"text": user}]}]}
+    if gen:
+        body["generationConfig"] = gen
     return body
 
 
@@ -505,14 +592,15 @@ def _pick_key(model, stop_at):
         _sleep(wait, stop_at)
 
 
-def call_gemini(chain, system, user, schema=None, level="default", patience=None):
+def call_gemini(chain, system, user, schema=None, level="default", patience=None, rounds=None):
     """Walk `chain` (models) x keys until one answers. Returns (text, model)."""
     if level == "default":
         level = get_thinking_level()
     stop_at = min(DEADLINE[0], time.time() + patience) if patience else DEADLINE[0]
     last_err = None
 
-    for rnd in range(1, CHAIN_ROUNDS + 1):
+    total_rounds = rounds or CHAIN_ROUNDS
+    for rnd in range(1, total_rounds + 1):
         live = [m for m in chain if m not in DEAD_MODELS
                 and any(_key_ok(k, m) for k in range(len(KEYS)))]
         if not live:
@@ -528,13 +616,18 @@ def call_gemini(chain, system, user, schema=None, level="default", patience=None
         for model in order:
             use_thinking = bool(level) and model not in NO_THINKING
             overloaded = False
-            for attempt in range(1, PER_MODEL_RETRIES + 1):
+            gem = is_gemma(model)
+            max_att = PER_MODEL_RETRIES + (4 if gem else 0)   # room for the capability fallbacks
+            for attempt in range(1, max_att + 1):
                 _guard(stop_at)
-                _wait_pause(stop_at)
+                if not gem:                      # a Flash pause must not delay Gemma
+                    _wait_pause(stop_at)
                 ki = _pick_key(model, stop_at)
                 if ki is None:
                     break
-                body = _build_body(system, user, schema, level if use_thinking else None)
+                body = _build_body(system, user, schema, level if use_thinking else None, model)
+                if gem:
+                    _gemma_throttle(ki, len(json.dumps(body, ensure_ascii=False)) // 3, stop_at)
                 try:
                     text = _gated_post(model, KEYS[ki], body, stop_at)
                     note_success(model)
@@ -557,11 +650,13 @@ def call_gemini(chain, system, user, schema=None, level="default", patience=None
                         DEAD_MODELS.add(model)
                         print(f"  {model}: not found -> skipping model")
                         break
-                    if e.code == 400 and use_thinking:
-                        NO_THINKING.add(model)
-                        use_thinking = False
-                        print(f"  {model}: thinkingConfig rejected, retrying without it")
-                        continue
+                    if e.code == 400:
+                        q = _degrade_quirk(model, raw, use_thinking, schema)
+                        if q:
+                            if q == "thinking":
+                                use_thinking = False
+                            print(f"  {model}: {q} rejected (HTTP 400), retrying without it")
+                            continue
                     if e.code in OVERLOAD_HTTP:
                         note_failure(model)
                         GATE.overload()
@@ -586,8 +681,8 @@ def call_gemini(chain, system, user, schema=None, level="default", patience=None
                 except Exception as e:  # network, timeout, malformed/empty response
                     last_err = f"{model} {e!r}"
 
-                if attempt < PER_MODEL_RETRIES:
-                    print(f"  {model} retry {attempt}/{PER_MODEL_RETRIES - 1} ({last_err[:110]})")
+                if attempt < max_att:
+                    print(f"  {model} retry {attempt}/{max_att - 1} ({last_err[:110]})")
                     _backoff(attempt, stop_at)
 
             MODEL_COOL[model] = time.time() + COOLDOWN_SECS
@@ -595,20 +690,23 @@ def call_gemini(chain, system, user, schema=None, level="default", patience=None
                 note_failure(model)
                 print(f"  {model} unavailable -> trying next model")
 
-        if rnd < CHAIN_ROUNDS:
+        if rnd < total_rounds:
             wait = ROUND_WAIT + random.uniform(0, 15)
             print(f"  all models failed (round {rnd}/{CHAIN_ROUNDS}); waiting {wait:.0f}s")
-            with LOCK:
-                PAUSE_UNTIL[0] = max(PAUSE_UNTIL[0], time.time() + wait)
-            _wait_pause(stop_at)
+            if not is_gemma(chain[0]):
+                with LOCK:
+                    PAUSE_UNTIL[0] = max(PAUSE_UNTIL[0], time.time() + wait)
+                _wait_pause(stop_at)
+            else:
+                _sleep(wait, stop_at)
             MODEL_COOL.clear()
 
     raise ApiUnavailable(f"all models failed: {last_err}")
 
 
-def call_quality(primary, system, user, schema=None, level="default"):
+def call_quality(primary, system, user, schema=None, level="default", rounds=None):
     """Quality chain only (no lite fallback). Returns (text, model, False)."""
-    text, model = call_gemini(build_chain(primary), system, user, schema, level, QUALITY_PATIENCE)
+    text, model = call_gemini(build_chain(primary), system, user, schema, level, QUALITY_PATIENCE, rounds)
     QUALITY_FAILS[0] = 0
     return text, model, False
 
@@ -634,7 +732,17 @@ def call_tiered(primary, system, user, schema=None, level="default"):
 def clean_json(text):
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except ValueError:                      # preamble / trailing words around the JSON (Gemma)
+        for o, c in (("[", "]"), ("{", "}")):
+            a, b = text.find(o), text.rfind(c)
+            if a != -1 and b > a:
+                try:
+                    return json.loads(text[a:b + 1])
+                except ValueError:
+                    pass
+        raise
 
 
 # ------------------------------------------------------------ markup helpers
@@ -713,6 +821,8 @@ class Job:
         n = len(units)
         self.ar = [None] * n          # raw Arabic (with markup)
         self.deg = [False] * n        # answered by a last-resort model
+        self.gem = [False] * n        # answered by Gemma (mid tier): must be reviewed by Flash
+        self.carry = set()            # Gemma units from a checkpoint: re-translated by Flash this run
         self.model = [""] * n
         self.kept_en = [False] * n
         self.reviewed = {}            # id -> "changed" | "unchanged"
@@ -870,9 +980,12 @@ def brief_text(job):
             f"Arabic tone: {b.get('tone', '')}")
 
 
-def glossary_text(job):
+def glossary_text(job, only_for=None):
     with job.lock:
         pairs = list(job.gloss.values())
+    if only_for is not None:                 # Gemma: only the terms present in this batch
+        low = only_for.lower()
+        pairs = [(en, ar) for en, ar in pairs if en.lower() in low]
     return "\n".join(f"- {en} -> {ar}" for en, ar in pairs) or "(none)"
 
 
@@ -880,9 +993,10 @@ def keep_text(job):
     return ", ".join(str(x) for x in job.brief.get("keep_english", []) if x) or "(none)"
 
 
-def corrections_text(job):
+def corrections_text(job, only_for=None):
+    low = only_for.lower() if only_for is not None else None
     rows = [f"- {c.get('heard', '')} -> {c.get('meant', '')}" for c in job.brief.get("asr_corrections", [])
-            if c.get("heard") and c.get("meant")]
+            if c.get("heard") and c.get("meant") and (low is None or str(c["heard"]).lower() in low)]
     return "\n".join(rows) or "(none)"
 
 
@@ -931,11 +1045,54 @@ def context_lines(job, idx_range, with_ar):
     return "\n".join(rows)
 
 
-def translate_batch(job, batch):
-    """Translate `batch` (list of units). Re-requests only what is missing; splits on repeated failure."""
+def needs_work(job, k, redo):
+    return job.ar[k] is None or (redo and (job.deg[k] or job.kept_en[k] or k in job.carry))
+
+
+def gemma_fallback(job, pending):
+    """Translate `pending` with Gemma in small batches. Returns the units still needing work."""
+    todo = [u for u in pending if not (job.gem[u["id"] - 1] and job.ar[u["id"] - 1] is not None)]
+    if not todo or not gemma_allowed():
+        return pending
+    cap = GEMMA_MAX_UNITS[job.kind]
+    try:
+        words = max(300, int(os.environ.get("TRANSLATE_GEMMA_WORDS", GEMMA_WORDS)))
+    except ValueError:
+        words = GEMMA_WORDS
+    subs, cur, w = [], [], 0
+    for u in todo:
+        if cur and (len(cur) >= cap or w + u["words"] > words):
+            subs.append(cur)
+            cur, w = [], 0
+        cur.append(u)
+        w += u["words"]
+    if cur:
+        subs.append(cur)
+    print(f"  Gemma tier: {len(todo)} unit(s) in {len(subs)} small request(s) "
+          f"({' -> '.join(gemma_chain())}); every Gemma unit is reviewed by Flash afterwards")
+    for sub in subs:
+        try:
+            translate_batch(job, sub, gemma=True)
+        except ApiUnavailable as e:
+            if e.fatal:
+                raise
+            print(f"  Gemma unavailable too: {str(e)[:100]}")
+            break
+        if PROGRESS_PATH[0]:
+            save_progress(PROGRESS_PATH[0], job)
+    return [u for u in pending if needs_work(job, u["id"] - 1, True)]
+
+
+def translate_batch(job, batch, gemma=False):
+    """Translate `batch` (list of units). Re-requests only what is missing; splits on repeated failure.
+    gemma=True: Gemma request (small batch, filtered glossary, units flagged for Flash review)."""
     system = SYSTEM_SRT if job.kind == "srt" else SYSTEM_TXT
     nb, na = CTX[job.kind]
     pending = list(batch)
+    if not gemma and gemma_allowed() and (job.lite_ok or time.time() < GEMMA_PREFER[0]):
+        pending = gemma_fallback(job, pending)      # Flash keeps failing: Gemma goes first for a while
+        if not pending:
+            return
 
     for attempt in range(1, 4):
         a, b = pending[0]["id"] - 1, pending[-1]["id"] - 1
@@ -946,10 +1103,11 @@ def translate_batch(job, batch):
                       "stay consistent through the GLOSSARY)")
         ctx_next = context_lines(job, range(b + 1, min(len(job.units), b + 1 + na)), False)
         items = json.dumps([{"i": u["id"], "en": u["en"]} for u in pending], ensure_ascii=False)
+        src = " ".join(u["en"] for u in pending) if gemma else None
         prompt = (
             f"{brief_text(job)}\n\n"
-            f"GLOSSARY (use these Arabic renderings exactly):\n{glossary_text(job)}\n\n"
-            f"KNOWN TRANSCRIPT MISHEARINGS (heard -> meant):\n{corrections_text(job)}\n\n"
+            f"GLOSSARY (use these Arabic renderings exactly):\n{glossary_text(job, src)}\n\n"
+            f"KNOWN TRANSCRIPT MISHEARINGS (heard -> meant):\n{corrections_text(job, src)}\n\n"
             f"KEEP IN ENGLISH (leave exactly as written):\n{keep_text(job)}\n\n"
             f"{prev_label}:\n{ctx_prev or '(none)'}\n\n"
             f"UPCOMING ITEMS (context only, do NOT translate):\n{ctx_next or '(none)'}\n\n"
@@ -957,12 +1115,27 @@ def translate_batch(job, batch):
             f'{{"i", "ar"}} using the same i values:\nITEMS:\n{items}'
         )
         try:
-            if job.lite_ok:
+            if gemma:
+                text, model = call_gemini(gemma_chain(), system, prompt, CHUNK_SCHEMA,
+                                          patience=GEMMA_PATIENCE, rounds=1)
+                degraded = False
+            elif job.lite_ok:
                 text, model, degraded = call_tiered(job.primary, system, prompt, CHUNK_SCHEMA)
             else:
-                text, model, degraded = call_quality(job.primary, system, prompt, CHUNK_SCHEMA)
+                text, model, degraded = call_quality(job.primary, system, prompt, CHUNK_SCHEMA,
+                                                     rounds=1 if GEMMA_PROBING[0] else None)
             result = clean_json(text)
-        except (SystemExit, ApiUnavailable):
+        except ApiUnavailable as e:
+            if e.fatal or gemma or job.lite_ok or not gemma_allowed():
+                raise
+            GEMMA_PROBING[0] = True
+            GEMMA_PREFER[0] = time.time() + GEMMA_PREFER_SECS
+            print("  Flash chain failed -> Gemma tier takes over for these units")
+            pending = gemma_fallback(job, pending)
+            if not pending:
+                return
+            raise
+        except SystemExit:
             raise
         except ResponseRejected as e:
             print(f"  response rejected: {e}")
@@ -979,6 +1152,8 @@ def translate_batch(job, batch):
             job.reviewed.pop(i, None)
             job.proofed.discard(i)
             job.deg[i - 1] = degraded
+            job.gem[i - 1] = gemma
+            job.carry.discard(i - 1)
             job.model[i - 1] = model
             job.learn_terms(ar)
         pending = [u for u in pending if u["id"] not in got]
@@ -986,6 +1161,12 @@ def translate_batch(job, batch):
             return
         print(f"  invalid/missing: {'; '.join(problems[:3])} (attempt {attempt}/3)")
 
+    if gemma:                                   # Gemma never keeps English: Flash gets the leftovers
+        if len(pending) > 1:
+            mid = len(pending) // 2
+            translate_batch(job, pending[:mid], gemma=True)
+            translate_batch(job, pending[mid:], gemma=True)
+        return
     if len(pending) == 1:
         u = pending[0]
         print(f"  WARNING: unit {u['id']} could not be translated; keeping English.")
@@ -1004,7 +1185,7 @@ def plan_chunks(job, redo_lite=False):
     limit_units = SRT_CHUNK_CUES if job.kind == "srt" else CHUNK_MAX_UNITS
     for u in job.units:
         k = u["id"] - 1
-        if job.ar[k] is not None and not (redo_lite and (job.deg[k] or job.kept_en[k])):
+        if not needs_work(job, k, redo_lite):
             continue
         cur.append(u)
         words += u["words"]
@@ -1074,6 +1255,8 @@ def check_unit(job, u):
         return ["could not be translated"]
     if job.deg[i]:
         reasons.append("answered by a fallback (lite) model")
+    if job.gem[i]:
+        reasons.append("translated by Gemma (mid tier): check terminology, meaning, omissions and grammar")
     ew, aw = wc(en), wc(plain)
     if ew >= 12:
         ratio = aw / ew
@@ -1143,7 +1326,7 @@ def review_pass(job):
     rm = os.environ.get("TRANSLATE_REVIEW_MODEL", DEFAULT_REVIEW_MODEL).strip()
     if rm.lower() in ("off", "none", "0"):
         print("Review pass disabled.")
-        job.review_log.append("review disabled (TRANSLATE_REVIEW_MODEL=off)")
+        job.review_log.append("المراجعة معطّلة (TRANSLATE_REVIEW_MODEL=off)")
         return
     try:
         cap = int(os.environ.get("TRANSLATE_REVIEW_MAX", "15"))
@@ -1159,13 +1342,14 @@ def review_pass(job):
     if not suspects:
         print("Checks: no suspect units.")
         return
-    must = [t for t in suspects if job.deg[t[0]["id"] - 1] or job.kept_en[t[0]["id"] - 1]]
+    must = [t for t in suspects if job.deg[t[0]["id"] - 1] or job.gem[t[0]["id"] - 1]
+            or job.kept_en[t[0]["id"] - 1]]
     others = sorted((t for t in suspects if t not in must), key=lambda t: -len(t[1]))
     chosen = must + others[:cap]
     print(f"Checks: {len(suspects)} suspect unit(s); reviewing {len(chosen)} "
-          f"({len(must)} lite/failed always, up to {cap} others).")
+          f"({len(must)} lite/Gemma/failed always, up to {cap} others).")
     if len(others) > cap:
-        job.review_log.append(f"{len(others) - cap} lower-priority suspect unit(s) not reviewed (cap {cap})")
+        job.review_log.append(f"{len(others) - cap} وحدة مشتبه بها أقل أولوية لم تُراجَع (الحد الأقصى {cap})")
     chain = ([rm] if rm else []) + [m for m in build_chain(job.primary) if m != rm]
     parts = [chosen[k:k + REVIEW_BATCH] for k in range(0, len(chosen), REVIEW_BATCH)]
     stopped = []
@@ -1174,7 +1358,7 @@ def review_pass(job):
         ids = [u["id"] for u, _ in part]
         if not ok:
             reason = str(val)[:140]
-            job.review_log.append(f"units {ids}: review NOT done ({reason})")
+            job.review_log.append(f"الوحدات {ids}: لم تتم المراجعة ({reason})")
             print(f"  review batch {ids} skipped: {reason}")
             if isinstance(val, ApiUnavailable) and val.fatal:
                 stopped.append(reason)
@@ -1186,22 +1370,26 @@ def review_pass(job):
             changed = strip_markup(ar) != strip_markup(old)
             job.ar[i - 1] = ar
             job.deg[i - 1] = False                       # a non-lite model has now read it
+            job.gem[i - 1] = False                       # reviewed by Flash
             if ARABIC_RE.search(strip_markup(ar)):
                 job.kept_en[i - 1] = False
             job.reviewed[i] = "changed" if changed else "unchanged"
             job.learn_terms(ar)
-            job.review_log.append(f"unit {i}: {'revised' if changed else 'confirmed'} by {model}")
+            job.review_log.append(f"الوحدة {i}: {'عُدّلت' if changed else 'أُكِّدت دون تغيير'} بواسطة {model}")
         missing = [i for i in ids if i not in got]
         if missing:
-            job.review_log.append(f"units {missing}: reviewer did not return them ({'; '.join(problems[:2])})")
+            job.review_log.append(f"الوحدات {missing}: لم يُرجعها المراجِع ({'; '.join(problems[:2])})")
             print(f"  review: {'; '.join(problems[:2])}")
 
     run_parallel(lambda part: _review_worker(job, chain, part), parts, min(PARALLEL[0], len(parts)), on_done)
     if stopped:
-        job.review_log.append(f"REVIEW STOPPED EARLY: {stopped[0]}")
+        job.review_log.append(f"توقفت المراجعة مبكرًا: {stopped[0]}")
     left = [u["id"] for u in job.units if job.deg[u["id"] - 1]]
     if left:
-        job.review_log.append(f"units still answered by a lite model after review: {left}")
+        job.review_log.append(f"وحدات ما زالت مترجمة بنموذج lite بعد المراجعة: {left}")
+    gleft = [u["id"] for u in job.units if job.gem[u["id"] - 1]]
+    if gleft:
+        job.review_log.append(f"وحدات Gemma التي لم تُراجَع (ستُعاد ترجمتها بنموذج Flash في التشغيل القادم): {gleft}")
 
 
 # ---------------------------------------------------------------- proofreading
@@ -1277,7 +1465,7 @@ def proofread_pass(job):
         ids = [u["id"] for u in batch]
         if not ok:
             stats["failed_batches"] += 1
-            job.proof_log.append(f"batch {ids[0]}-{ids[-1]}: proofreading NOT done ({str(val)[:140]})")
+            job.proof_log.append(f"الدفعة {ids[0]}-{ids[-1]}: لم يتم التدقيق اللغوي ({str(val)[:140]})")
             print(f"  proofreading batch {ids[0]}-{ids[-1]} skipped: {str(val)[:100]}")
             return
         corrections, _model = val
@@ -1294,7 +1482,7 @@ def proofread_pass(job):
                 continue
             job.ar[i - 1] = raw.replace(old, new, 1)
             stats["applied"] += 1
-            job.proof_log.append(f"unit {i}: {old} -> {new}")
+            job.proof_log.append(f"الوحدة {i}: {old} -> {new}")
 
     run_parallel(lambda b: _proof_worker(job, chain, level, b), batches, min(PARALLEL[0], len(batches)), on_done)
     print(f"  proofreading: {stats['applied']} correction(s) applied, {stats['rejected']} rejected, "
@@ -1323,7 +1511,7 @@ def autotag_terms(job, rendered, seen):
             if hit:
                 rendered[i] = rendered[i][:hit.end()] + f" ({en})" + rendered[i][hit.end():]
                 seen.add(en.lower())
-                job.autotag_log.append(f"unit {i + 1}: {ar} ({en})")
+                job.autotag_log.append(f"الوحدة {i + 1}: {ar} ({en})")
                 break
 
 
@@ -1351,37 +1539,72 @@ def write_output(path, job, rendered, bilingual):
                 f.write(f"{ar}\n\n")
 
 
+_REASON_AR = [
+    ("not translated", "لم تُترجم"),
+    ("could not be translated", "تعذّرت ترجمتها"),
+    ("answered by a fallback (lite) model", "ترجمها نموذج احتياطي (lite)"),
+    ("translated by Gemma (mid tier): check terminology, meaning, omissions and grammar",
+     "ترجمها Gemma (مستوى متوسط): تحقّق من المصطلحات والمعنى والحذف والقواعد"),
+    ("possible omission (Arabic/English length", "احتمال حذف (نسبة طول العربي/الإنجليزي"),
+    ("possible addition (Arabic/English length", "احتمال إضافة (نسبة طول العربي/الإنجليزي"),
+    ("untranslated English: ", "إنجليزية غير مترجمة: "),
+    ("numbers not found in Arabic: ", "أرقام غير موجودة في الترجمة العربية: "),
+    ("glossary terms not marked: ", "مصطلحات من القاموس غير موسومة: "),
+]
+_STAGE_AR = {
+    "context pass": "مرحلة السياق",
+    "translation (quality models only)": "الترجمة (النماذج عالية الجودة فقط)",
+    "translation (lite last resort)": "الترجمة (نموذج lite كحل أخير)",
+    "review": "المراجعة",
+    "proofreading": "التدقيق اللغوي",
+}
+
+
+def reason_ar(r):
+    for en, ar in _REASON_AR:
+        if r.startswith(en):
+            return ar + r[len(en):]
+    return r
+
+
 def write_report(path, job, started):
-    lines = [f"Translation report ({time.strftime('%Y-%m-%d %H:%M:%S')}, {(time.time() - started) / 60:.1f} min)",
-             f"Input kind: {job.kind} | units: {len(job.units)} | domain: {job.brief.get('domain', '')}",
-             "Requests per model: " + (", ".join(f"{m}: {c}" for m, c in USED.most_common()) or "-"),
-             f"Units still marked as answered by a fallback (lite) model: {sum(job.deg)}",
-             f"Units kept in English (failed): {sum(job.kept_en)}",
-             f"Units reviewed: {len(job.reviewed)} "
-             f"(revised: {sum(1 for v in job.reviewed.values() if v == 'changed')})",
-             "", "== Speech-recognition corrections noted by the context pass =="]
-    lines += [f"- {c.get('heard')} -> {c.get('meant')}" for c in job.brief.get("asr_corrections", [])] or ["(none)"]
-    lines += ["", "== Remaining flags after review =="]
+    lines = [f"تقرير الترجمة ({time.strftime('%Y-%m-%d %H:%M:%S')}، {(time.time() - started) / 60:.1f} دقيقة)",
+             f"نوع المدخل: {job.kind} | عدد الوحدات: {len(job.units)} | المجال: {job.brief.get('domain', '')}",
+             "الطلبات لكل نموذج: " + ("، ".join(f"{m}: {c}" for m, c in USED.most_common()) or "-"),
+             f"وحدات ما زالت مترجمة بنموذج احتياطي (lite): {sum(job.deg)}",
+             f"وحدات ترجمها Gemma ولم تُراجَع بعد: {sum(job.gem)}",
+             f"وحدات بقيت بالإنجليزية (فشلت ترجمتها): {sum(job.kept_en)}",
+             f"وحدات تمت مراجعتها: {len(job.reviewed)} "
+             f"(المعدَّلة منها: {sum(1 for v in job.reviewed.values() if v == 'changed')})",
+             "", "== تصحيحات التعرّف على الكلام التي رصدتها مرحلة السياق =="]
+    lines += [f"- {c.get('heard')} -> {c.get('meant')}" for c in job.brief.get("asr_corrections", [])] or ["(لا يوجد)"]
+    lines += ["", "== ملاحظات متبقية بعد المراجعة =="]
     flagged = [(u, check_unit(job, u)) for u in job.units if job.ar[u["id"] - 1] is not None]
     flagged = [(u, r) for u, r in flagged if r]
     for u, r in flagged:
-        lines.append(f"- unit {u['id']} (starts: {u['en'][:70]!r}): {'; '.join(r)}")
+        lines.append(f"- الوحدة {u['id']} (تبدأ بـ: {u['en'][:70]!r}): {'؛ '.join(reason_ar(x) for x in r)}")
     if not flagged:
-        lines.append("(none)")
-    lines += ["", "== Review log =="] + (job.review_log or ["(none)"])
-    lines += ["", "== Language proofreading ==",
-              f"corrections applied: {job.proof_stats['applied']} | rejected: {job.proof_stats['rejected']} "
-              f"| failed batches: {job.proof_stats['failed_batches']}"] + job.proof_log[:300]
-    lines += ["", f"== Auto-tagged terms (English added by the program): {len(job.autotag_log)} =="] \
-        + (job.autotag_log or ["(none)"])
-    lines += ["", "== Timing =="] + [f"{n}: {d / 60:.1f} min, {r} request(s)" for n, d, r in TIMINGS]
-    lines += [f"time spent waiting/back-off (summed over threads): {WAIT[0] / 60:.1f} min",
-              "HTTP errors per model: " + (", ".join(f"{m} HTTP {c}: {n}" for (m, c), n in sorted(ERRS.items()))
-                                           or "none")]
+        lines.append("(لا يوجد)")
+    lines += ["", "== سجل المراجعة =="] + (job.review_log or ["(لا يوجد)"])
+    lines += ["", "== التدقيق اللغوي ==",
+              f"التصحيحات المطبّقة: {job.proof_stats['applied']} | المرفوضة: {job.proof_stats['rejected']} "
+              f"| الدفعات الفاشلة: {job.proof_stats['failed_batches']}"] + job.proof_log[:300]
+    lines += ["", f"== مصطلحات وُسمت تلقائيًا (أضاف البرنامج الإنجليزية): {len(job.autotag_log)} =="] \
+        + (job.autotag_log or ["(لا يوجد)"])
+    lines += ["", "== التوقيت =="] + [f"{_STAGE_AR.get(n, n)}: {d / 60:.1f} دقيقة، {r} طلب" for n, d, r in TIMINGS]
+    gused = {m: c for m, c in USED.items() if is_gemma(m)}
+    lines += [f"مستوى Gemma: الطلبات {dict(gused) or 0} | وحدات أُبقي عليها من Gemma بعد المراجعة: "
+              f"{sum(1 for k, m in enumerate(job.model) if is_gemma(m) and not job.gem[k])} "
+              f"| أخطاء 503 لكل نموذج: " + ("، ".join(f"{m}: {n}" for (m, c), n in sorted(ERRS.items()) if c == 503)
+                                          or "لا يوجد"),
+              "بدائل قدرات النماذج: " + ("؛ ".join(QUIRK_LOG) or "لا يوجد")]
+    lines += [f"الوقت المقضي في الانتظار/التأجيل (مجموع الخيوط): {WAIT[0] / 60:.1f} دقيقة",
+              "أخطاء HTTP لكل نموذج: " + ("، ".join(f"{m} HTTP {c}: {n}" for (m, c), n in sorted(ERRS.items()))
+                                         or "لا يوجد")]
     redo = [u["id"] for u in job.units if job.ar[u["id"] - 1] is None or job.deg[u["id"] - 1]
-            or job.kept_en[u["id"] - 1]]
-    lines += ["", f"== Units to redo on the next run (lite / English / untranslated): {len(redo)} ==", str(redo)]
-    lines += ["", f"== Final glossary ({len(job.gloss)} terms) =="]
+            or job.gem[u["id"] - 1] or job.kept_en[u["id"] - 1]]
+    lines += ["", f"== وحدات تُعاد في التشغيل القادم (lite / إنجليزية / غير مترجمة): {len(redo)} ==", str(redo)]
+    lines += ["", f"== القاموس النهائي ({len(job.gloss)} مصطلح) =="]
     lines += [f"{en} = {ar}" for en, ar in job.gloss.values()]
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -1391,7 +1614,8 @@ def save_progress(path, job):
     with job.lock:
         data = {
             "fingerprint": job.fingerprint(), "brief": job.brief, "gloss": dict(job.gloss),
-            "core": sorted(job.core), "ar": list(job.ar), "deg": list(job.deg), "model": list(job.model),
+            "core": sorted(job.core), "ar": list(job.ar), "deg": list(job.deg), "gem": list(job.gem),
+            "model": list(job.model),
             "kept_en": list(job.kept_en), "reviewed": {str(k): v for k, v in job.reviewed.items()},
             "proofed": sorted(job.proofed),
         }
@@ -1416,6 +1640,8 @@ def load_progress(path, job):
         job.core = set(data["core"])
         job.ar, job.deg = data["ar"], data["deg"]
         job.model, job.kept_en = data["model"], data["kept_en"]
+        job.gem = data.get("gem") or [False] * len(job.units)
+        job.carry = {k for k, g in enumerate(job.gem) if g}
         job.reviewed = {int(k): v for k, v in data.get("reviewed", {}).items()}
         job.proofed = set(data.get("proofed", []))
         done = sum(1 for a in job.ar if a is not None)
@@ -1471,11 +1697,13 @@ def main():
         PARALLEL[0] = max(1, min(3, len(KEYS)))
     print(f"Parsed {len(segments)} segments -> {len(units)} {'cues' if kind == 'srt' else 'paragraphs'} "
           f"({words} words). Keys: {len(KEYS)} | quality chain: {' -> '.join(build_chain(model))} "
+          f"| gemma: {' -> '.join(gemma_chain()) if gemma_allowed() else 'off'} "
           f"| last resort: {' -> '.join(last_resort_chain())} | thinking: {get_thinking_level() or 'default'} "
           f"| budget: {minutes:.0f} min | parallel: {PARALLEL[0]}")
 
     GATE.setup(PARALLEL[0])
     progress_path = f"{prefix}_progress.json"
+    PROGRESS_PATH[0] = progress_path
     resumed = load_progress(progress_path, job)
 
     try:
@@ -1581,11 +1809,12 @@ def main():
         print(f"Wrote {p}")
     write_report(f"{prefix}_report.txt", job, started)
     print(f"Wrote {prefix}_report.txt")
-    incomplete = any(a is None for a in job.ar) or any(job.deg) or any(job.kept_en)
+    incomplete = any(a is None for a in job.ar) or any(job.deg) or any(job.gem) or any(job.kept_en)
     if incomplete:
         save_progress(progress_path, job)
-        n = sum(1 for k in range(len(units)) if job.ar[k] is None or job.deg[k] or job.kept_en[k])
-        print(f"INCOMPLETE: {n} unit(s) are untranslated or came from a lite model (listed in the report). "
+        n = sum(1 for k in range(len(units)) if job.ar[k] is None or job.deg[k] or job.gem[k] or job.kept_en[k])
+        print(f"INCOMPLETE: {n} unit(s) are untranslated, came from a lite model or are unreviewed Gemma output "
+              f"(listed in the report). "
               f"Checkpoint kept: {progress_path} - commit it and run again after the daily quota resets "
               f"(midnight Pacific time); only those units will be redone.")
     else:
