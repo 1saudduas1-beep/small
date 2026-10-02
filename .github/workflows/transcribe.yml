@@ -25,7 +25,7 @@ on:
         required: true
         type: string
       base_name:
-        description: 'Output file base name (optional)'
+        description: 'Output file base name (optional; any name is accepted and cleaned automatically, Arabic letters are kept)'
         required: false
         default: 'transcript'
         type: string
@@ -55,7 +55,7 @@ on:
       reuse_previous:
         description: 'Reuse the transcript + translation checkpoint of a previous run of the same link (skips transcription)'
         required: false
-        default: true
+        default: false
         type: boolean
       translate:
         description: 'Translate transcript to Arabic with Gemini'
@@ -103,6 +103,33 @@ jobs:
       GEMINI_MODEL: ${{ github.event.inputs.gemini_model }}
 
     steps:
+      # Normalize free-form inputs. Any file name is accepted: it is cleaned
+      # (Unicode letters/digits and '-' are kept, everything else becomes '_',
+      # max 80 chars, empty -> "transcript") and the final name is announced.
+      # The link is trimmed. Raw values are never echoed into workflow commands.
+      - name: Normalize inputs
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          env_file = os.environ["GITHUB_ENV"]
+          raw = os.environ.get("BASE_NAME", "")
+          name = "".join(c if (c.isalnum() or c == "-") else "_" for c in raw.strip())
+          name = re.sub(r"_+", "_", name).strip("_-")[:80].strip("_-") or "transcript"
+          url = os.environ.get("SHARE_URL", "").strip()
+          if not url or re.search(r"\s", url):
+              print("::error::share_url must be a single link without spaces inside it.")
+              sys.exit(1)
+          with open(env_file, "a", encoding="utf-8") as f:
+              f.write(f"SAFE_NAME={name}\nCLEAN_URL={url}\n")
+          msg = f"Output file base name: {name}"
+          if name != raw:
+              print(f"::notice::{msg} (the requested name was adjusted to a safe file name)")
+          else:
+              print(msg)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write(f"### Output name: `{name}`\n")
+          PY
+
       # Fail fast: catch bad inputs / a missing API key BEFORE spending
       # minutes on installs and transcription. Also decides the audio SOURCE.
       - name: Validate inputs
@@ -110,19 +137,11 @@ jobs:
           TRANSLATE: ${{ github.event.inputs.translate }}
           HAS_GEMINI_KEY: ${{ secrets.GEMINI_API_KEY != '' }}
         run: |
-          if [[ ! "$BASE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
-            echo "::error::base_name must be 1-64 chars: letters, digits, '.', '_' or '-' (starting with a letter or digit)."
-            exit 1
-          fi
-          if [[ "$SHARE_URL" =~ [[:space:]] ]]; then
-            echo "::error::share_url must be a single link without spaces."
-            exit 1
-          fi
           YT_RE='^https://(((www|m|music)\.)?youtube\.com|youtu\.be)/'
           NLM_RE='^https://([A-Za-z0-9-]+\.)+google(\.com)?([/?#]|$)'
-          if [[ "$SHARE_URL" =~ $YT_RE ]]; then
+          if [[ "$CLEAN_URL" =~ $YT_RE ]]; then
             SOURCE=youtube
-          elif [[ "$SHARE_URL" =~ $NLM_RE ]]; then
+          elif [[ "$CLEAN_URL" =~ $NLM_RE ]]; then
             SOURCE=notebooklm
           else
             echo "::error::share_url must be an https NotebookLM (Google) link or a youtube.com / youtu.be video link."
@@ -134,7 +153,7 @@ jobs:
           fi
           echo "Audio source: $SOURCE"
           echo "SOURCE=$SOURCE" >> "$GITHUB_ENV"
-          KEY="$(printf '%s' "$SHARE_URL|$OUTPUT_FORMAT|$MODEL_SIZE|$BASE_NAME" | sha1sum | cut -c1-16)"
+          KEY="$(printf '%s' "$CLEAN_URL|$OUTPUT_FORMAT|$MODEL_SIZE|$SAFE_NAME" | sha1sum | cut -c1-16)"
           echo "TCACHE=transcribe-$KEY" >> "$GITHUB_ENV"
 
       - name: Checkout repository
@@ -146,8 +165,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: |
-            ${{ github.event.inputs.base_name }}.${{ github.event.inputs.output_format }}
-            ${{ github.event.inputs.base_name }}_progress.json
+            ${{ env.SAFE_NAME }}.${{ github.event.inputs.output_format }}
+            ${{ env.SAFE_NAME }}_progress.json
           key: ${{ env.TCACHE }}-${{ github.run_id }}
           restore-keys: |
             ${{ env.TCACHE }}-
@@ -156,9 +175,9 @@ jobs:
         env:
           MATCHED: ${{ steps.prev.outputs.cache-matched-key }}
         run: |
-          if [[ -n "$MATCHED" && -s "$BASE_NAME.$OUTPUT_FORMAT" ]]; then
+          if [[ -n "$MATCHED" && -s "$SAFE_NAME.$OUTPUT_FORMAT" ]]; then
             echo "Restored transcript from cache ($MATCHED) - download and transcription are skipped."
-            ls -l "$BASE_NAME"* || true
+            ls -l "$SAFE_NAME"* || true
             echo "HAVE_TRANSCRIPT=true" >> "$GITHUB_ENV"
           else
             echo "No previous transcript found - full run."
@@ -213,7 +232,7 @@ jobs:
       - name: Extract direct audio URL from share link
         if: ${{ env.SOURCE == 'notebooklm' && env.HAVE_TRANSCRIPT != 'true' }}
         run: |
-          python extract_audio_url.py "$SHARE_URL" "$RUNNER_TEMP/audio_url.txt"
+          python extract_audio_url.py "$CLEAN_URL" "$RUNNER_TEMP/audio_url.txt"
           # The signed URL grants access to the audio: keep it out of the logs
           # (and out of the uploaded artifact, so it lives in RUNNER_TEMP).
           echo "::add-mask::$(cat "$RUNNER_TEMP/audio_url.txt")"
@@ -250,7 +269,7 @@ jobs:
           YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
           YOUTUBE_MAX_MINUTES: '240'
         run: |
-          python download_youtube_audio.py "$SHARE_URL" input_audio "$RUNNER_TEMP/audio_file.txt"
+          python download_youtube_audio.py "$CLEAN_URL" input_audio "$RUNNER_TEMP/audio_file.txt"
           NAME="$(cat "$RUNNER_TEMP/audio_file.txt")"
           if [[ ! "$NAME" =~ ^input_audio\.[A-Za-z0-9]{1,5}$ ]]; then
             echo "::error::Unexpected audio file name from the downloader."
@@ -283,7 +302,7 @@ jobs:
       - name: Transcribe with faster-whisper
         if: ${{ env.HAVE_TRANSCRIPT != 'true' }}
         run: |
-          python transcribe.py "$AUDIO_FILE" "$BASE_NAME.$OUTPUT_FORMAT" "$OUTPUT_FORMAT" "$MODEL_SIZE"
+          python transcribe.py "$AUDIO_FILE" "$SAFE_NAME.$OUTPUT_FORMAT" "$OUTPUT_FORMAT" "$MODEL_SIZE"
 
       - name: Translate to Arabic with Gemini
         if: ${{ github.event.inputs.translate == 'true' }}
@@ -310,25 +329,25 @@ jobs:
           # TRANSLATE_REVIEW_MAX: '15'
         run: |
           python translate_transcript.py \
-            "$BASE_NAME.$OUTPUT_FORMAT" \
-            "$BASE_NAME" \
+            "$SAFE_NAME.$OUTPUT_FORMAT" \
+            "$SAFE_NAME" \
             "$TRANSLATION_OUTPUT" \
             "$GEMINI_MODEL"
 
       # Keep transcript + checkpoint for the next run of the same link (also on failure).
       - name: Save transcript and checkpoint for resume
-        if: ${{ always() && !cancelled() }}
+        if: ${{ always() && !cancelled() && env.TCACHE != '' }}
         uses: actions/cache/save@v4
         with:
           path: |
-            ${{ github.event.inputs.base_name }}.${{ github.event.inputs.output_format }}
-            ${{ github.event.inputs.base_name }}_progress.json
+            ${{ env.SAFE_NAME }}.${{ github.event.inputs.output_format }}
+            ${{ env.SAFE_NAME }}_progress.json
           key: ${{ env.TCACHE }}-${{ github.run_id }}
 
       - name: Flag incomplete translation
-        if: ${{ always() && github.event.inputs.translate == 'true' }}
+        if: ${{ always() && env.SAFE_NAME != '' && github.event.inputs.translate == 'true' }}
         run: |
-          REPORT="${BASE_NAME}_report.txt"
+          REPORT="${SAFE_NAME}_report.txt"
           [[ -f "$REPORT" ]] || exit 0
           N="$(grep -oP '== Units to redo on the next run[^:]*: \K[0-9]+' "$REPORT" || echo 0)"
           if [[ "${N:-0}" -gt 0 ]]; then
@@ -341,13 +360,13 @@ jobs:
       # only present on extraction failure) are never lost. The job still ends
       # red on failure.
       - name: Upload transcript artifact
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.SAFE_NAME != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.inputs.base_name }}
+          name: ${{ env.SAFE_NAME }}
           path: |
-            ${{ github.event.inputs.base_name }}*.${{ github.event.inputs.output_format }}
-            ${{ github.event.inputs.base_name }}_report.txt
-            ${{ github.event.inputs.base_name }}_progress.json
+            ${{ env.SAFE_NAME }}*.${{ github.event.inputs.output_format }}
+            ${{ env.SAFE_NAME }}_report.txt
+            ${{ env.SAFE_NAME }}_progress.json
             debug_extract.png
           retention-days: 14
