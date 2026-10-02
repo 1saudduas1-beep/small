@@ -1,10 +1,20 @@
 name: Transcribe Audio
 
+# Place this file at .github/workflows/transcribe-2.yml in the repository.
+# The Python scripts (transcribe.py, extract_audio_url.py,
+# download_youtube_audio.py, translate_transcript.py) live at the repository root.
+#
+# Sources: a NotebookLM Audio Overview share link OR a single YouTube video link.
+# Optional secrets: GEMINI_API_KEY (translation), YOUTUBE_COOKIES (paste the
+# text of a cookies.txt from a throwaway YouTube account; usually needed
+# because YouTube blocks GitHub's datacenter IPs). YOUTUBE_COOKIES_B64
+# (the same file base64-encoded) is also accepted.
+
 on:
   workflow_dispatch:
     inputs:
       share_url:
-        description: 'NotebookLM Audio Overview share link'
+        description: 'NotebookLM Audio Overview share link OR YouTube video link'
         required: true
         type: string
       base_name:
@@ -13,7 +23,7 @@ on:
         default: 'transcript'
         type: string
       output_format:
-        description: 'Output format'
+        description: 'Output format (txt = one complete sentence per entry, srt = timed cues)'
         required: false
         default: 'srt'
         type: choice
@@ -32,6 +42,7 @@ on:
           - medium
           - large-v2
           - large-v3
+          - large-v3-turbo
           - distil-large-v3
 
       translate:
@@ -81,16 +92,37 @@ jobs:
       GEMINI_MODEL: ${{ github.event.inputs.gemini_model }}
 
     steps:
+      # Fail fast: catch bad inputs / a missing API key BEFORE spending
+      # minutes on installs and transcription. Also decides the audio SOURCE.
       - name: Validate inputs
+        env:
+          TRANSLATE: ${{ github.event.inputs.translate }}
+          HAS_GEMINI_KEY: ${{ secrets.GEMINI_API_KEY != '' }}
         run: |
           if [[ ! "$BASE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
             echo "::error::base_name must be 1-64 chars: letters, digits, '.', '_' or '-' (starting with a letter or digit)."
             exit 1
           fi
-          if [[ ! "$SHARE_URL" =~ ^https://[^[:space:]]+$ ]]; then
-            echo "::error::share_url must be a single https:// link."
+          if [[ "$SHARE_URL" =~ [[:space:]] ]]; then
+            echo "::error::share_url must be a single link without spaces."
             exit 1
           fi
+          YT_RE='^https://(((www|m|music)\.)?youtube\.com|youtu\.be)/'
+          NLM_RE='^https://([A-Za-z0-9-]+\.)+google(\.com)?([/?#]|$)'
+          if [[ "$SHARE_URL" =~ $YT_RE ]]; then
+            SOURCE=youtube
+          elif [[ "$SHARE_URL" =~ $NLM_RE ]]; then
+            SOURCE=notebooklm
+          else
+            echo "::error::share_url must be an https NotebookLM (Google) link or a youtube.com / youtu.be video link."
+            exit 1
+          fi
+          if [[ "$TRANSLATE" == "true" && "$HAS_GEMINI_KEY" != "true" ]]; then
+            echo "::error::Translation is enabled but the GEMINI_API_KEY repository secret is not set."
+            exit 1
+          fi
+          echo "Audio source: $SOURCE"
+          echo "SOURCE=$SOURCE" >> "$GITHUB_ENV"
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -105,10 +137,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2
 
-      - name: Install Python dependencies
+      - name: Install faster-whisper
         run: |
-          pip install faster-whisper playwright
+          pip install "faster-whisper>=1.2.1,<2"
+
+      - name: Install Playwright (NotebookLM source)
+        if: ${{ env.SOURCE == 'notebooklm' }}
+        run: |
+          pip install "playwright>=1.40,<2"
           playwright install --with-deps chromium
+
+      # YouTube breaks older yt-dlp builds quickly, so always take the latest.
+      # "[default]" brings the yt-dlp-ejs challenge solver; it needs a JS runtime (Deno).
+      - name: Install yt-dlp and Deno (YouTube source)
+        if: ${{ env.SOURCE == 'youtube' }}
+        run: |
+          pip install -U "yt-dlp[default]"
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
+          "$HOME/.deno/bin/deno" --version
+          yt-dlp --version
 
       - name: Cache Whisper model
         uses: actions/cache@v4
@@ -121,11 +169,17 @@ jobs:
           # a new cache entry instead of invalidating the old one.
           key: hf-whisper-${{ github.event.inputs.model_size }}
 
+      # ---------------------------------------------------- source: NotebookLM
       - name: Extract direct audio URL from share link
+        if: ${{ env.SOURCE == 'notebooklm' }}
         run: |
-          python extract_audio_url.py "$SHARE_URL" audio_url.txt
+          python extract_audio_url.py "$SHARE_URL" "$RUNNER_TEMP/audio_url.txt"
+          # The signed URL grants access to the audio: keep it out of the logs
+          # (and out of the uploaded artifact, so it lives in RUNNER_TEMP).
+          echo "::add-mask::$(cat "$RUNNER_TEMP/audio_url.txt")"
 
       - name: Download audio from extracted direct link
+        if: ${{ env.SOURCE == 'notebooklm' }}
         run: |
           # The captured googlevideo.com URL is signed/IP-locked and time-limited,
           # so a single-connection curl download was the main bottleneck for
@@ -145,16 +199,49 @@ jobs:
             --console-log-level=warn \
             --summary-interval=5 \
             --out=input_audio.mp4 \
-            "$(cat audio_url.txt)"
+            "$(cat "$RUNNER_TEMP/audio_url.txt")"
+          echo "AUDIO_FILE=input_audio.mp4" >> "$GITHUB_ENV"
 
+      # ------------------------------------------------------ source: YouTube
+      - name: Download audio from YouTube
+        if: ${{ env.SOURCE == 'youtube' }}
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+          YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
+          YOUTUBE_MAX_MINUTES: '240'
+        run: |
+          python download_youtube_audio.py "$SHARE_URL" input_audio "$RUNNER_TEMP/audio_file.txt"
+          NAME="$(cat "$RUNNER_TEMP/audio_file.txt")"
+          if [[ ! "$NAME" =~ ^input_audio\.[A-Za-z0-9]{1,5}$ ]]; then
+            echo "::error::Unexpected audio file name from the downloader."
+            exit 1
+          fi
+          echo "AUDIO_FILE=$NAME" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------ common
       - name: Verify download
         run: |
-          ls -lh input_audio.mp4
-          ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1 input_audio.mp4
+          ls -lh "$AUDIO_FILE"
+          SIZE=$(stat -c %s "$AUDIO_FILE")
+          if [[ "$SOURCE" == "notebooklm" ]]; then
+            # googlevideo URLs carry the full file size as `clen`: a mismatch
+            # means a truncated/partial download that would silently lose audio.
+            CLEN=$(grep -oP '[?&]clen=\K[0-9]+' "$RUNNER_TEMP/audio_url.txt" || true)
+            if [[ -n "$CLEN" && "$SIZE" -ne "$CLEN" ]]; then
+              echo "::error::Downloaded $SIZE bytes but the server reports $CLEN bytes (partial download)."
+              exit 1
+            fi
+          fi
+          DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$AUDIO_FILE" || true)
+          echo "duration=$DUR"
+          if ! awk -v d="$DUR" 'BEGIN { exit !(d + 0 > 0) }'; then
+            echo "::error::The downloaded file has no readable audio duration."
+            exit 1
+          fi
 
       - name: Transcribe with faster-whisper
         run: |
-          python transcribe.py input_audio.mp4 "$BASE_NAME.$OUTPUT_FORMAT" "$OUTPUT_FORMAT" "$MODEL_SIZE"
+          python transcribe.py "$AUDIO_FILE" "$BASE_NAME.$OUTPUT_FORMAT" "$OUTPUT_FORMAT" "$MODEL_SIZE"
 
       - name: Translate to Arabic with Gemini
         if: ${{ github.event.inputs.translate == 'true' }}
@@ -174,12 +261,16 @@ jobs:
             "$TRANSLATION_OUTPUT" \
             "$GEMINI_MODEL"
 
-      # Runs even if translation failed, so the Whisper transcript (and any
-      # partial translation) is never lost. The job still ends red on failure.
+      # Runs even if an earlier step failed, so the Whisper transcript, any
+      # partial translation and the extraction screenshot (debug_extract.png,
+      # only present on extraction failure) are never lost. The job still ends
+      # red on failure.
       - name: Upload transcript artifact
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.base_name }}
-          path: ${{ github.event.inputs.base_name }}*.${{ github.event.inputs.output_format }}
+          path: |
+            ${{ github.event.inputs.base_name }}*.${{ github.event.inputs.output_format }}
+            debug_extract.png
           retention-days: 14
