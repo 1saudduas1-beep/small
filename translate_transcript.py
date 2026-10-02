@@ -37,6 +37,20 @@ How it works
      parentheses at their first appearance (done by the program).
   8. TIMING: every stage's duration and request count are printed and reported.
 
+v9 - SPEED + QUALITY (free tier, target <= 30 min)
+    * Streaming requests with a first-token timeout that depends on the thinking level
+      (low 30s / medium 60s / high 90s): a stuck request fails in seconds, not minutes.
+    * Per-model circuit breaker (escalating 60s -> 300s) instead of a global stop; while the
+      service is congested each batch is sent to TWO models at once and the first complete,
+      valid answer wins (HEDGE).
+    * Context pass on a bounded sample (medium thinking); adaptive batch size so all
+      TRANSLATE_PARALLEL workers are busy; ONE merged quality pass (MQM-style review of the
+      suspect units + proofreading of the rest, in parallel).
+    * Glossary terms are ENFORCED by the program (marked term replaced by the glossary
+      Arabic when it deviates) and a per-term adherence table is written to the report.
+    * A complete file is always produced: Gemma / lite drafts are upgraded by Flash in the
+      quality pass, anything left is redone on the next run.
+
 Resilience
     * Quality chain (3.8 -> 3.6 -> 3.7). HTTP 503 means the MODEL is overloaded,
       not the key: no key rotation, the request moves to the next model at once.
@@ -98,8 +112,12 @@ Uses only the Python standard library.
 import hashlib
 import json
 import os
+import difflib
+import io
+import queue
 import random
 import re
+import socket
 import sys
 import threading
 import time
@@ -121,19 +139,24 @@ QUALITY_CHAIN = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.7-flash", "ge
 LAST_RESORT = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 DEFAULT_REVIEW_MODEL = ""          # empty = use the quality chain (free tier has no pro quota)
 
-PER_MODEL_RETRIES = 4
-CHAIN_ROUNDS = 2
-ROUND_WAIT = 45
-COOLDOWN_SECS = 60
-MAX_SERVER_DELAY = 90
-REQUEST_TIMEOUT = 420
-DEFAULT_MAX_MINUTES = 60
-QUALITY_PATIENCE = 240       # seconds spent on the quality chain per request
-SHORT_PATIENCE = 45          # after 2 consecutive degradations
+PER_MODEL_RETRIES = 3
+CHAIN_ROUNDS = 3
+ROUND_WAIT = 15
+COOLDOWN_SECS = 25
+MAX_SERVER_DELAY = 60
+REQUEST_TIMEOUT = 240        # hard cap for one streamed request
+TOTAL_TIMEOUT = REQUEST_TIMEOUT
+DEFAULT_MAX_MINUTES = 30
+QUALITY_PATIENCE = 150       # seconds spent on the quality chain per request
+SHORT_PATIENCE = 30          # after 2 consecutive degradations
+FIRST_TOKEN = {None: 25, "minimal": 25, "low": 30, "medium": 60, "high": 90}   # seconds to the first streamed byte
+HEDGE_WINDOW = 120           # a 503/timeout in the last N seconds = congested -> hedge
+HEDGE_PATIENCE = 120
+MIN_CHUNK_WORDS = 1200
 REVIEW_BATCH = 10
 OVERLOAD_HTTP = {503}        # model overloaded: fail over at once, never rotate keys
 DEMOTE_AFTER = 2             # consecutive failures before a model is demoted
-DEMOTE_SECS = 600            # a demoted model is tried last for this long
+DEMOTE_SECS = 60             # circuit breaker: base open time, doubles per extra failure (max 300s)
 STICKY_SECS = 300            # the model that just succeeded is tried FIRST for this long
 PROOF_BATCH = 40
 GEMMA = ["gemma-4-31b-it", "gemma-4-26b-a4b-it"]
@@ -143,11 +166,11 @@ GEMMA_TPM = 14_000           # input tokens per minute per key (limit 16K, safet
 GEMMA_RPM = 26               # requests per minute per key (limit 30)
 GEMMA_PATIENCE = 150         # seconds per Gemma request (all Gemma models)
 GEMMA_PREFER_SECS = 240      # after a Flash failure new batches try Gemma first for this long
-CONTEXT_PATIENCE = 420
-RETRY_PAUSE = (45, 75)       # seconds to pause between translation rounds when models are busy
+CONTEXT_PATIENCE = 240
+RETRY_PAUSE = (12, 25)       # seconds to pause between translation rounds when all models are busy
 # share of the time budget at which each stage must be finished
-STAGE_FRAC = {"context": 0.20, "context_lite": 0.30, "translate": 0.55, "lite": 0.65, "review": 0.82, "proof": 0.95}
-CONTEXT_CAP_CHARS = 600_000
+STAGE_FRAC = {"context": 0.15, "context_lite": 0.25, "translate": 0.55, "lite": 0.65, "review": 0.93, "proof": 0.95}
+CONTEXT_CAP_CHARS = 150_000
 
 RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 BLOCK_REASONS = {"SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"}
@@ -194,6 +217,10 @@ GEMMA_PREFER = [0.0]     # unix time until which new batches try Gemma before Fl
 GEMMA_PROBING = [False]  # True once Flash has failed: Flash is then probed with a single round
 GEMMA_WIN = {}           # key index -> [(time, tokens)] sliding window for the Gemma limits
 PROGRESS_PATH = [None]
+SAVE_LOCK = threading.Lock()
+LAST_OVERLOAD = [0.0]    # unix time of the last 503 / first-token timeout
+HEDGE_STATS = Counter()  # launched / second_won
+HEALTH_CHAIN = []        # quality chain (set in main) used by the circuit breaker
 
 
 class Gate:
@@ -328,7 +355,7 @@ def _degrade_quirk(model, raw, thinking_on, schema):
     if pick is None:
         return None
     sets[pick].add(model)
-    QUIRK_LOG.append(f"{model}: تم رفض '{pick}' (HTTP 400) -> مُعطَّل لهذا النموذج")
+    QUIRK_LOG.append(f"{model}: '{pick}' rejected (HTTP 400) -> disabled for this model")
     return pick
 
 
@@ -338,9 +365,9 @@ def note_failure(model):
         if STICKY[0] == model:
             STICKY[0], STICKY[1] = None, 0.0
         if MODEL_FAILS[model] >= DEMOTE_AFTER:
-            DEMOTED[model] = time.time() + DEMOTE_SECS
-            if MODEL_FAILS[model] == DEMOTE_AFTER:
-                print(f"  {model}: {DEMOTE_AFTER} failures in a row -> demoted for {DEMOTE_SECS // 60} min")
+            dur = min(300, DEMOTE_SECS * 2 ** (MODEL_FAILS[model] - DEMOTE_AFTER))
+            DEMOTED[model] = time.time() + dur
+            print(f"  {model}: {MODEL_FAILS[model]} failures in a row -> circuit open for {dur}s (other models carry on)")
 
 
 def note_success(model):
@@ -479,29 +506,67 @@ def _build_body(system, user, schema, thinking, model=""):
     return body
 
 
-def _post(model, api_key, body):
+def _first_token(level, gem=False):
+    t = FIRST_TOKEN.get(level, 30)
+    return max(t, 45) if gem else t
+
+
+def _is_timeout(e):
+    r = getattr(e, "reason", None)
+    return isinstance(e, (socket.timeout, TimeoutError)) or isinstance(r, (socket.timeout, TimeoutError))
+
+
+def _post(model, api_key, body, first_token=30):
+    """Streamed request. `first_token` is the socket timeout: it bounds the wait for the first
+    byte (thinking happens before it) and any later silent gap; the total is capped too."""
+    url = API_URL.format(model=model).replace(":generateContent", ":streamGenerateContent") + "?alt=sse"
     req = urllib.request.Request(
-        API_URL.format(model=model),
-        data=json.dumps(body).encode("utf-8"),
+        url, data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
     )
-    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-        out = json.loads(resp.read().decode("utf-8"))
-
-    block = (out.get("promptFeedback") or {}).get("blockReason")
+    t0 = time.time()
+    texts, finish, block = [], None, None
+    with urllib.request.urlopen(req, timeout=first_token) as resp:
+        relaxed = False
+        for raw in resp:
+            if not relaxed:                       # first byte arrived: allow normal gaps between chunks
+                relaxed = True
+                try:
+                    resp.fp.raw._sock.settimeout(max(first_token, 60))
+                except Exception:
+                    pass
+            if ABORT[0]:
+                raise ApiUnavailable("aborted", fatal=True)
+            if time.time() - t0 > TOTAL_TIMEOUT:
+                raise TimeoutError("total request time exceeded")
+            line = raw.decode("utf-8", "ignore").strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                out = json.loads(payload)
+            except ValueError:
+                continue
+            err = out.get("error")
+            if isinstance(err, dict):
+                code = int(err.get("code") or 500)
+                raise urllib.error.HTTPError(url, code, str(err.get("message", ""))[:200], None,
+                                             io.BytesIO(json.dumps(out).encode("utf-8")))
+            block = block or (out.get("promptFeedback") or {}).get("blockReason")
+            for cand in out.get("candidates") or []:
+                finish = cand.get("finishReason") or finish
+                for p in (cand.get("content") or {}).get("parts") or []:
+                    if p.get("text") and not p.get("thought"):
+                        texts.append(p["text"])
     if block:
         raise ResponseRejected(f"prompt blocked ({block})")
-    cands = out.get("candidates") or []
-    if not cands:
-        raise ValueError("no candidates in response")
-    cand = cands[0]
-    finish = cand.get("finishReason")
     if finish == "MAX_TOKENS":
         raise ResponseRejected("output truncated (MAX_TOKENS)")
     if finish in BLOCK_REASONS:
         raise ResponseRejected(f"response blocked ({finish})")
-    parts = (cand.get("content") or {}).get("parts") or []
-    text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+    text = "".join(texts)
     if not text.strip():
         raise ValueError(f"empty response (finishReason={finish})")
     return text
@@ -533,7 +598,7 @@ def _sleep(seconds, stop_at):
 
 
 def _backoff(attempt, stop_at):
-    wait = min(5 * 2 ** (attempt - 1), 45)
+    wait = min(3 * 2 ** (attempt - 1), 30)
     _sleep(wait + random.uniform(0, wait * 0.4), stop_at)
 
 
@@ -543,10 +608,18 @@ def _retry_delay(raw):
     return float(m.group(1)) if m else None
 
 
-def _wait_pause(stop_at):
+def _any_healthy():
+    now = time.time()
+    return any(m not in DEAD_MODELS and DEMOTED.get(m, 0) <= now and MODEL_COOL.get(m, 0) <= now
+               for m in HEALTH_CHAIN)
+
+
+def _wait_pause(stop_at, force=False):
+    """Shared pause. Skipped while at least one model of the chain is healthy (circuit breaker),
+    unless `force` (every model just failed a whole round)."""
     while True:
         left = PAUSE_UNTIL[0] - time.time()
-        if left <= 0:
+        if left <= 0 or (not force and _any_healthy()):
             return
         _sleep(min(left, 5), stop_at)
 
@@ -556,10 +629,10 @@ def chain_alive(chain):
     return any(m not in DEAD_MODELS and any(_key_ok(k, m) for k in range(len(KEYS))) for m in chain)
 
 
-def _gated_post(model, key, body, stop_at):
+def _gated_post(model, key, body, stop_at, first_token=30):
     GATE.acquire(stop_at)
     try:
-        return _post(model, key, body)
+        return _post(model, key, body, first_token)
     finally:
         GATE.release()
 
@@ -629,7 +702,8 @@ def call_gemini(chain, system, user, schema=None, level="default", patience=None
                 if gem:
                     _gemma_throttle(ki, len(json.dumps(body, ensure_ascii=False)) // 3, stop_at)
                 try:
-                    text = _gated_post(model, KEYS[ki], body, stop_at)
+                    text = _gated_post(model, KEYS[ki], body, stop_at,
+                                       _first_token(level if use_thinking else None, gem))
                     note_success(model)
                     GATE.success()
                     return text, model
@@ -660,6 +734,7 @@ def call_gemini(chain, system, user, schema=None, level="default", patience=None
                     if e.code in OVERLOAD_HTTP:
                         note_failure(model)
                         GATE.overload()
+                        LAST_OVERLOAD[0] = time.time()
                         overloaded = True
                         print(f"  {model} overloaded (HTTP {e.code}) -> next model (keys are not rotated)")
                         break
@@ -678,8 +753,17 @@ def call_gemini(chain, system, user, schema=None, level="default", patience=None
                     if e.code not in RETRYABLE_HTTP:
                         print(f"  {model}: non-retryable HTTP {e.code}, skipping model")
                         break
+                except ApiUnavailable:
+                    raise
                 except Exception as e:  # network, timeout, malformed/empty response
                     last_err = f"{model} {e!r}"
+                    if _is_timeout(e):                 # no answer in time: fail over at once
+                        note_failure(model)
+                        GATE.overload()
+                        LAST_OVERLOAD[0] = time.time()
+                        overloaded = True
+                        print(f"  {model} gave no answer in time -> next model")
+                        break
 
                 if attempt < max_att:
                     print(f"  {model} retry {attempt}/{max_att - 1} ({last_err[:110]})")
@@ -696,7 +780,7 @@ def call_gemini(chain, system, user, schema=None, level="default", patience=None
             if not is_gemma(chain[0]):
                 with LOCK:
                     PAUSE_UNTIL[0] = max(PAUSE_UNTIL[0], time.time() + wait)
-                _wait_pause(stop_at)
+                _wait_pause(stop_at, force=True)
             else:
                 _sleep(wait, stop_at)
             MODEL_COOL.clear()
@@ -709,6 +793,58 @@ def call_quality(primary, system, user, schema=None, level="default", rounds=Non
     text, model = call_gemini(build_chain(primary), system, user, schema, level, QUALITY_PATIENCE, rounds)
     QUALITY_FAILS[0] = 0
     return text, model, False
+
+
+def congested():
+    return time.time() - LAST_OVERLOAD[0] < HEDGE_WINDOW
+
+
+def call_hedged(primary, system, user, schema, level, pending):
+    """While the service is congested: ask two models at once, first COMPLETE valid answer wins
+    (best partial otherwise). Returns (text, model) or None when hedging is not possible."""
+    now = time.time()
+    live = [m for m in build_chain(primary) if m not in DEAD_MODELS
+            and any(_key_ok(k, m) for k in range(len(KEYS)))]
+    healthy = [m for m in live if DEMOTED.get(m, 0) <= now and MODEL_COOL.get(m, 0) <= now]
+    pair = (healthy + [m for m in live if m not in healthy])[:2]
+    if len(pair) < 2:
+        return None
+    if level == "default":
+        level = get_thinking_level()
+    q = queue.Queue()
+
+    def run(m, rank):
+        try:
+            text, model = call_gemini([m], system, user, schema, level, HEDGE_PATIENCE, 1)
+            got, _ = parse_items(clean_json(text), pending)
+            q.put((True, (text, model, len(got), rank)))
+        except BaseException as e:      # incl. ApiUnavailable / ResponseRejected / bad JSON
+            q.put((False, e))
+
+    HEDGE_STATS["launched"] += 1
+    for rank, m in enumerate(pair):
+        threading.Thread(target=run, args=(m, rank), daemon=True).start()
+    best, errs = None, []
+    for _ in pair:
+        ok, val = q.get()
+        if not ok:
+            errs.append(val)
+            continue
+        if val[2] == len(pending):
+            if val[3] == 1:
+                HEDGE_STATS["second_won"] += 1
+            return val[0], val[1]
+        if best is None or val[2] > best[2]:
+            best = val
+    if best and best[2] > 0:
+        return best[0], best[1]
+    for e in errs:
+        if isinstance(e, ApiUnavailable) and e.fatal:
+            raise e
+    for e in errs:
+        if isinstance(e, ResponseRejected):
+            raise e
+    raise ApiUnavailable("hedged request failed on both models")
 
 
 def call_tiered(primary, system, user, schema=None, level="default"):
@@ -791,6 +927,67 @@ def swap_known_english(job, raw):
     return "".join(parts)
 
 
+def _ar_tokens(text):
+    return {AR_PREFIX_RE.sub("", w) for w in re.findall(r"[\u0600-\u06FF]+", text)} - {""}
+
+
+def _same_term(ar, std):
+    """True when `ar` is the glossary term (or an inflection: plural, gender, prefix)."""
+    a, b = _ar_tokens(ar), _ar_tokens(std)
+    if a & b:
+        return True
+    return any(difflib.SequenceMatcher(None, x, y).ratio() >= 0.6 for x in a for y in b)
+
+
+def enforce_glossary(job, raw):
+    """A marked glossary term whose Arabic shares no word with the glossary rendering is replaced
+    by the glossary Arabic (inflections that keep the stem are left alone)."""
+    def repl(m):
+        ar, en = m.group(1).strip(), m.group(2).strip()
+        k = en.lower()
+        if k not in job.core or not ARABIC_RE.search(ar):
+            return m.group(0)
+        std = job.gloss.get(k, ("", ""))[1].strip()
+        if not std or not ARABIC_RE.search(std) or _same_term(ar, std):
+            return m.group(0)
+        new = std
+        if ar.startswith("ال") and not std.startswith("ال") and len(std.split()) == 1:
+            new = "ال" + std
+        with job.lock:
+            job.term_log.append(f"{en}: {ar} -> {new}")
+        return f"⟦{new}|{en}⟧"
+    return MARK_RE.sub(repl, raw)
+
+
+def post_process(job, ar):
+    return swap_known_english(job, enforce_glossary(job, fix_marks(ar)))
+
+
+def term_adherence(job):
+    rows = []
+    for k in sorted(job.core):
+        en, ar = job.gloss.get(k, (k, ""))
+        toks = _ar_tokens(ar)
+        if not toks:
+            continue
+        std = ar
+        pat = re.compile(r"(?<![A-Za-z])" + re.escape(k) + r"(?![A-Za-z])", re.I)
+        hit = ok = 0
+        for i, u in enumerate(job.units):
+            if job.ar[i] and pat.search(u["en"]):
+                hit += 1
+                if _same_term(strip_markup(job.ar[i]), std):
+                    ok += 1
+        if hit:
+            rows.append((ok / hit, hit, en, ar))
+    rows.sort()
+    out = [f"{en} = {ar}: {ok:.0%} ({hit} unit(s))" for ok, hit, en, ar in rows[:20]]
+    tot = sum(h for _, h, _, _ in rows)
+    good = sum(r * h for r, h, _, _ in rows)
+    head = f"Weighted average adherence: {good / tot:.0%}" if tot else "(no terms to measure)"
+    return [head] + out
+
+
 def render_text(text, seen):
     """⟦ar|en⟧ -> 'ar (en)' on the first appearance of `en`, else 'ar'."""
     def repl(m):
@@ -837,6 +1034,7 @@ class Job:
         self.gloss = {}               # english.lower() -> (english, arabic)
         self.core = set()             # keys that came from the context pass
         self.review_log = []
+        self.term_log = []
 
     def fingerprint(self):
         h = hashlib.sha256()
@@ -896,6 +1094,11 @@ CONTEXT_SCHEMA = {
 }
 
 
+def context_level():
+    lvl = os.environ.get("CONTEXT_THINKING", "medium").strip().lower()
+    return None if lvl in ("", "off", "none") else lvl
+
+
 def sample_for_context(units):
     full = "\n".join(u["en"] for u in units)
     if len(full) <= CONTEXT_CAP_CHARS:
@@ -923,27 +1126,41 @@ def build_brief(job):
         "Leave empty if none.\n\n"
         f"TRANSCRIPT:\n{sample_for_context(job.units)}"
     )
+    empty = {"domain": "", "summary": "", "tone": "", "glossary": [], "asr_corrections": [], "keep_english": []}
+    lvl = context_level()
+    text = None
     try:
         try:
             text, _ = call_gemini(build_chain(job.primary), CONTEXT_SYSTEM, prompt, CONTEXT_SCHEMA,
-                                  level="high", patience=CONTEXT_PATIENCE)
+                                  level=lvl, patience=CONTEXT_PATIENCE)
         except ApiUnavailable as e:
             if e.fatal and not isinstance(e, StageTimeUp):
                 raise
-            print("  quality models unavailable for the context pass -> using lite models (weaker glossary)")
             set_stage_end("context_lite")
-            text, _, _ = call_tiered(job.primary, CONTEXT_SYSTEM, prompt, CONTEXT_SCHEMA, level="high")
+            if gemma_allowed():
+                print("  Flash unavailable for the context pass -> trying Gemma")
+                try:
+                    text, _ = call_gemini(gemma_chain(), CONTEXT_SYSTEM, prompt, CONTEXT_SCHEMA,
+                                          level=lvl, patience=GEMMA_PATIENCE * 2, rounds=1)
+                except ApiUnavailable as e2:
+                    if e2.fatal and not isinstance(e2, StageTimeUp):
+                        raise
+            if text is None:
+                print("  using lite models for the context pass (weaker glossary)")
+                text, _, _ = call_tiered(job.primary, CONTEXT_SYSTEM, prompt, CONTEXT_SCHEMA, level=lvl)
         brief = clean_json(text)
-        for k, v in (("domain", ""), ("summary", ""), ("tone", ""), ("glossary", []), ("asr_corrections", []),
-                     ("keep_english", [])):
+        for k, v in empty.items():
             brief.setdefault(k, v)
         return brief
+    except StageTimeUp:
+        print("  context pass ran out of time -> continuing without a brief (glossary is learned from the "
+              "translation; the next run rebuilds it)")
+        return dict(empty)
     except (SystemExit, ApiUnavailable):
         raise
     except Exception as e:  # bad JSON / rejected output: continue without a brief
         print(f"  (context pass failed, continuing without brief: {e!r})")
-        return {"domain": "", "summary": "", "tone": "", "glossary": [], "asr_corrections": [],
-                "keep_english": []}
+        return dict(empty)
 
 
 # ---------------------------------------------------------------- translation
@@ -1122,8 +1339,15 @@ def translate_batch(job, batch, gemma=False):
             elif job.lite_ok:
                 text, model, degraded = call_tiered(job.primary, system, prompt, CHUNK_SCHEMA)
             else:
-                text, model, degraded = call_quality(job.primary, system, prompt, CHUNK_SCHEMA,
-                                                     rounds=1 if GEMMA_PROBING[0] else None)
+                hedged = call_hedged(job.primary, system, prompt, CHUNK_SCHEMA, "default", pending) \
+                    if congested() else None
+                if hedged:
+                    text, model = hedged
+                    degraded = False
+                    QUALITY_FAILS[0] = 0
+                else:
+                    text, model, degraded = call_quality(job.primary, system, prompt, CHUNK_SCHEMA,
+                                                         rounds=1 if GEMMA_PROBING[0] else None)
             result = clean_json(text)
         except ApiUnavailable as e:
             if e.fatal or gemma or job.lite_ok or not gemma_allowed():
@@ -1146,7 +1370,7 @@ def translate_batch(job, batch, gemma=False):
 
         got, problems = parse_items(result, pending)
         for i, ar in got.items():
-            ar = swap_known_english(job, fix_marks(ar))
+            ar = post_process(job, ar)
             job.ar[i - 1] = ar
             job.kept_en[i - 1] = False
             job.reviewed.pop(i, None)
@@ -1180,16 +1404,20 @@ def translate_batch(job, batch, gemma=False):
 
 
 def plan_chunks(job, redo_lite=False):
-    """Units still to translate (and, with redo_lite, those that only have a lite/English draft)."""
+    """Units still to translate (and, with redo_lite, those that only have a lite/English draft).
+    Batch size adapts so that every parallel worker gets work."""
+    todo = [u for u in job.units if needs_work(job, u["id"] - 1, redo_lite)]
+    workers = max(1, PARALLEL[0])
+    cw, cu = CHUNK_WORDS, SRT_CHUNK_CUES if job.kind == "srt" else CHUNK_MAX_UNITS
+    if todo and job.kind == "txt":
+        cw = max(MIN_CHUNK_WORDS, min(CHUNK_WORDS, -(-sum(u["words"] for u in todo) // workers)))
+    elif todo:
+        cu = max(15, min(cu, -(-len(todo) // workers)))
     chunks, cur, words = [], [], 0
-    limit_units = SRT_CHUNK_CUES if job.kind == "srt" else CHUNK_MAX_UNITS
-    for u in job.units:
-        k = u["id"] - 1
-        if not needs_work(job, k, redo_lite):
-            continue
+    for u in todo:
         cur.append(u)
         words += u["words"]
-        if len(cur) >= limit_units or (job.kind == "txt" and words >= CHUNK_WORDS):
+        if len(cur) >= cu or (job.kind == "txt" and words >= cw):
             chunks.append(cur)
             cur, words = [], 0
     if cur:
@@ -1290,6 +1518,7 @@ def check_unit(job, u):
 # ---------------------------------------------------------------- review
 REVIEW_SYSTEM = """You are a senior English-to-Arabic medical translator reviewing drafts of a transcribed lecture.
 For every item you get: the English source (automatic transcript - it may contain mishearings), the current Arabic draft (with ⟦arabic|English⟧ term markup) and the issues that were detected.
+Work like an MQM evaluator: for each item silently classify problems as ACCURACY (mistranslation, omission, addition, mishearing, wrong number), TERMINOLOGY (not the glossary term, inconsistent), FLUENCY (grammar, agreement, calques, awkward or unnatural phrasing) or STYLE, then output the corrected text only.
 Fix: mistranslations, omissions, additions, speech-recognition mishearings, non-standard or inconsistent terminology (follow the glossary exactly), ungrammatical or awkward Arabic (verb forms, gender/number agreement, odd phrases), leftover English, wrong numbers. Words under KEEP IN ENGLISH must stay in English.
 Keep the markup rules: every technical term stays wrapped as ⟦arabic|English⟧ and no English is written in parentheses by you.
 If a draft is already correct, return it unchanged. Never summarise, never add content.
@@ -1310,7 +1539,7 @@ def _review_worker(job, chain, part):
     for _ in range(2):                      # a failed batch is retried once
         try:
             text, model = call_gemini(chain, REVIEW_SYSTEM, prompt, CHUNK_SCHEMA,
-                                      level="high", patience=QUALITY_PATIENCE)
+                                      level="high", patience=QUALITY_PATIENCE, rounds=1)
             got, problems = parse_items(clean_json(text), [u for u, _r in part])
             return got, problems, model
         except ApiUnavailable as e:
@@ -1322,16 +1551,16 @@ def _review_worker(job, chain, part):
     raise RuntimeError(f"failed twice: {str(last)[:140]}")
 
 
-def review_pass(job):
+def plan_review(job):
     rm = os.environ.get("TRANSLATE_REVIEW_MODEL", DEFAULT_REVIEW_MODEL).strip()
     if rm.lower() in ("off", "none", "0"):
         print("Review pass disabled.")
-        job.review_log.append("المراجعة معطّلة (TRANSLATE_REVIEW_MODEL=off)")
-        return
+        job.review_log.append("Review disabled (TRANSLATE_REVIEW_MODEL=off)")
+        return [], []
     try:
-        cap = int(os.environ.get("TRANSLATE_REVIEW_MAX", "15"))
+        cap = int(os.environ.get("TRANSLATE_REVIEW_MAX", "30"))
     except ValueError:
-        cap = 15
+        cap = 30
     suspects = []
     for u in job.units:
         if job.ar[u["id"] - 1] is None or u["id"] in job.reviewed:
@@ -1341,7 +1570,7 @@ def review_pass(job):
             suspects.append((u, reasons))
     if not suspects:
         print("Checks: no suspect units.")
-        return
+        return [], []
     must = [t for t in suspects if job.deg[t[0]["id"] - 1] or job.gem[t[0]["id"] - 1]
             or job.kept_en[t[0]["id"] - 1]]
     others = sorted((t for t in suspects if t not in must), key=lambda t: -len(t[1]))
@@ -1349,47 +1578,38 @@ def review_pass(job):
     print(f"Checks: {len(suspects)} suspect unit(s); reviewing {len(chosen)} "
           f"({len(must)} lite/Gemma/failed always, up to {cap} others).")
     if len(others) > cap:
-        job.review_log.append(f"{len(others) - cap} وحدة مشتبه بها أقل أولوية لم تُراجَع (الحد الأقصى {cap})")
+        job.review_log.append(f"{len(others) - cap} lower-priority suspect unit(s) not reviewed (cap {cap})")
     chain = ([rm] if rm else []) + [m for m in build_chain(job.primary) if m != rm]
-    parts = [chosen[k:k + REVIEW_BATCH] for k in range(0, len(chosen), REVIEW_BATCH)]
-    stopped = []
+    return [chosen[k:k + REVIEW_BATCH] for k in range(0, len(chosen), REVIEW_BATCH)], chain
 
-    def on_done(part, ok, val):
-        ids = [u["id"] for u, _ in part]
-        if not ok:
-            reason = str(val)[:140]
-            job.review_log.append(f"الوحدات {ids}: لم تتم المراجعة ({reason})")
-            print(f"  review batch {ids} skipped: {reason}")
-            if isinstance(val, ApiUnavailable) and val.fatal:
-                stopped.append(reason)
-            return
-        got, problems, model = val
-        for i, ar in got.items():
-            ar = swap_known_english(job, fix_marks(ar))
-            old = job.ar[i - 1]
-            changed = strip_markup(ar) != strip_markup(old)
-            job.ar[i - 1] = ar
-            job.deg[i - 1] = False                       # a non-lite model has now read it
-            job.gem[i - 1] = False                       # reviewed by Flash
-            if ARABIC_RE.search(strip_markup(ar)):
-                job.kept_en[i - 1] = False
-            job.reviewed[i] = "changed" if changed else "unchanged"
-            job.learn_terms(ar)
-            job.review_log.append(f"الوحدة {i}: {'عُدّلت' if changed else 'أُكِّدت دون تغيير'} بواسطة {model}")
-        missing = [i for i in ids if i not in got]
-        if missing:
-            job.review_log.append(f"الوحدات {missing}: لم يُرجعها المراجِع ({'; '.join(problems[:2])})")
-            print(f"  review: {'; '.join(problems[:2])}")
 
-    run_parallel(lambda part: _review_worker(job, chain, part), parts, min(PARALLEL[0], len(parts)), on_done)
-    if stopped:
-        job.review_log.append(f"توقفت المراجعة مبكرًا: {stopped[0]}")
-    left = [u["id"] for u in job.units if job.deg[u["id"] - 1]]
-    if left:
-        job.review_log.append(f"وحدات ما زالت مترجمة بنموذج lite بعد المراجعة: {left}")
-    gleft = [u["id"] for u in job.units if job.gem[u["id"] - 1]]
-    if gleft:
-        job.review_log.append(f"وحدات Gemma التي لم تُراجَع (ستُعاد ترجمتها بنموذج Flash في التشغيل القادم): {gleft}")
+def review_done(job, part, ok, val, stopped):
+    ids = [u["id"] for u, _ in part]
+    if not ok:
+        reason = str(val)[:140]
+        job.review_log.append(f"Units {ids}: not reviewed ({reason})")
+        print(f"  review batch {ids} skipped: {reason}")
+        if isinstance(val, ApiUnavailable) and val.fatal:
+            stopped.append(reason)
+        return
+    got, problems, model = val
+    for i, ar in got.items():
+        ar = post_process(job, ar)
+        old = job.ar[i - 1]
+        changed = strip_markup(ar) != strip_markup(old)
+        job.ar[i - 1] = ar
+        job.deg[i - 1] = False                       # a non-lite model has now read it
+        job.gem[i - 1] = False                       # reviewed by Flash
+        if ARABIC_RE.search(strip_markup(ar)):
+            job.kept_en[i - 1] = False
+        job.reviewed[i] = "changed" if changed else "unchanged"
+        job.proofed.add(i)                           # the review also fixes language
+        job.learn_terms(ar)
+        job.review_log.append(f"Unit {i}: {'revised' if changed else 'confirmed unchanged'} by {model}")
+    missing = [i for i in ids if i not in got]
+    if missing:
+        job.review_log.append(f"Units {missing}: not returned by the reviewer ({'; '.join(problems[:2])})")
+        print(f"  review: {'; '.join(problems[:2])}")
 
 
 # ---------------------------------------------------------------- proofreading
@@ -1428,7 +1648,7 @@ def _proof_worker(job, chain, level, batch):
     for _ in range(2):
         try:
             text, model = call_gemini(chain, PROOF_SYSTEM, prompt, PROOF_SCHEMA, level=level,
-                                      patience=QUALITY_PATIENCE)
+                                      patience=QUALITY_PATIENCE, rounds=1)
             res = clean_json(text)
             if isinstance(res, dict):
                 res = res.get("corrections") or res.get("items") or []
@@ -1444,10 +1664,10 @@ def _proof_worker(job, chain, level, batch):
     raise RuntimeError(f"failed twice: {str(last)[:140]}")
 
 
-def proofread_pass(job):
+def plan_proof(job, skip):
     if os.environ.get("TRANSLATE_PROOFREAD", "on").strip().lower() in ("off", "none", "0"):
         print("Proofreading pass disabled.")
-        return
+        return [], None, None
     try:
         size = max(5, int(os.environ.get("TRANSLATE_PROOF_BATCH", PROOF_BATCH)))
     except ValueError:
@@ -1455,38 +1675,70 @@ def proofread_pass(job):
     lvl = os.environ.get("TRANSLATE_PROOF_LEVEL", "medium").strip().lower()
     level = None if lvl in ("", "off", "none") else lvl
     todo = [u for u in job.units if job.ar[u["id"] - 1] and not job.kept_en[u["id"] - 1]
-            and u["id"] not in job.proofed]
-    batches = [todo[k:k + size] for k in range(0, len(todo), size)]
-    chain = build_chain(job.primary)
-    print(f"Proofreading {len(todo)} paragraph(s) in {len(batches)} request(s)...")
+            and u["id"] not in job.proofed and u["id"] not in skip]
+    return [todo[k:k + size] for k in range(0, len(todo), size)], build_chain(job.primary), level
+
+
+def proof_done(job, batch, ok, val):
     stats = job.proof_stats
+    ids = [u["id"] for u in batch]
+    if not ok:
+        stats["failed_batches"] += 1
+        job.proof_log.append(f"Batch {ids[0]}-{ids[-1]}: not proofread ({str(val)[:140]})")
+        print(f"  proofreading batch {ids[0]}-{ids[-1]} skipped: {str(val)[:100]}")
+        return
+    corrections, _model = val
+    job.proofed.update(ids)
+    for c in corrections:
+        if not isinstance(c, dict) or not isinstance(c.get("i"), int) or c["i"] not in ids:
+            stats["rejected"] += 1
+            continue
+        i, old, new = c["i"], c.get("old"), c.get("new")
+        raw = job.ar[i - 1] or ""
+        if not isinstance(old, str) or not isinstance(new, str) or raw.count(old) != 1 \
+                or not _correction_ok(old, new):
+            stats["rejected"] += 1
+            continue
+        job.ar[i - 1] = raw.replace(old, new, 1)
+        stats["applied"] += 1
+        job.proof_log.append(f"Unit {i}: {old} -> {new}")
 
-    def on_done(batch, ok, val):
-        ids = [u["id"] for u in batch]
-        if not ok:
-            stats["failed_batches"] += 1
-            job.proof_log.append(f"الدفعة {ids[0]}-{ids[-1]}: لم يتم التدقيق اللغوي ({str(val)[:140]})")
-            print(f"  proofreading batch {ids[0]}-{ids[-1]} skipped: {str(val)[:100]}")
-            return
-        corrections, _model = val
-        job.proofed.update(ids)
-        for c in corrections:
-            if not isinstance(c, dict) or not isinstance(c.get("i"), int) or c["i"] not in ids:
-                stats["rejected"] += 1
-                continue
-            i, old, new = c["i"], c.get("old"), c.get("new")
-            raw = job.ar[i - 1] or ""
-            if not isinstance(old, str) or not isinstance(new, str) or raw.count(old) != 1 \
-                    or not _correction_ok(old, new):
-                stats["rejected"] += 1
-                continue
-            job.ar[i - 1] = raw.replace(old, new, 1)
-            stats["applied"] += 1
-            job.proof_log.append(f"الوحدة {i}: {old} -> {new}")
 
-    run_parallel(lambda b: _proof_worker(job, chain, level, b), batches, min(PARALLEL[0], len(batches)), on_done)
-    print(f"  proofreading: {stats['applied']} correction(s) applied, {stats['rejected']} rejected, "
-          f"{stats['failed_batches']} batch(es) failed")
+def qa_pass(job):
+    """ONE merged quality pass: MQM-style review of the suspect units and proofreading of all the
+    others, run together in parallel."""
+    parts, rchain = plan_review(job)
+    skip = {u["id"] for part in parts for u, _ in part}
+    batches, pchain, plevel = plan_proof(job, skip)
+    tasks = [("review", p) for p in parts] + [("proof", b) for b in batches]
+    if not tasks:
+        return
+    print(f"Quality pass: {len(parts)} review + {len(batches)} proofreading request(s) in parallel.")
+    stopped = []
+
+    def work(t):
+        kind, payload = t
+        return _review_worker(job, rchain, payload) if kind == "review" \
+            else _proof_worker(job, pchain, plevel, payload)
+
+    def done(t, ok, val):
+        if t[0] == "review":
+            review_done(job, t[1], ok, val, stopped)
+        else:
+            proof_done(job, t[1], ok, val)
+
+    run_parallel(work, tasks, min(PARALLEL[0], len(tasks)), done)
+    if stopped:
+        job.review_log.append(f"Review stopped early: {stopped[0]}")
+    left = [u["id"] for u in job.units if job.deg[u["id"] - 1]]
+    if left:
+        job.review_log.append(f"Units still translated by a lite model after review: {left}")
+    gleft = [u["id"] for u in job.units if job.gem[u["id"] - 1]]
+    if gleft:
+        job.review_log.append(f"Gemma units not reviewed (will be re-translated by Flash on the next run): {gleft}")
+    st = job.proof_stats
+    print(f"  proofreading: {st['applied']} correction(s) applied, {st['rejected']} rejected, "
+          f"{st['failed_batches']} batch(es) failed; glossary enforced {len(job.term_log)} time(s)")
 
 
 # ---------------------------------------------------------------- output
@@ -1511,7 +1763,7 @@ def autotag_terms(job, rendered, seen):
             if hit:
                 rendered[i] = rendered[i][:hit.end()] + f" ({en})" + rendered[i][hit.end():]
                 seen.add(en.lower())
-                job.autotag_log.append(f"الوحدة {i + 1}: {ar} ({en})")
+                job.autotag_log.append(f"Unit {i + 1}: {ar} ({en})")
                 break
 
 
@@ -1539,72 +1791,58 @@ def write_output(path, job, rendered, bilingual):
                 f.write(f"{ar}\n\n")
 
 
-_REASON_AR = [
-    ("not translated", "لم تُترجم"),
-    ("could not be translated", "تعذّرت ترجمتها"),
-    ("answered by a fallback (lite) model", "ترجمها نموذج احتياطي (lite)"),
-    ("translated by Gemma (mid tier): check terminology, meaning, omissions and grammar",
-     "ترجمها Gemma (مستوى متوسط): تحقّق من المصطلحات والمعنى والحذف والقواعد"),
-    ("possible omission (Arabic/English length", "احتمال حذف (نسبة طول العربي/الإنجليزي"),
-    ("possible addition (Arabic/English length", "احتمال إضافة (نسبة طول العربي/الإنجليزي"),
-    ("untranslated English: ", "إنجليزية غير مترجمة: "),
-    ("numbers not found in Arabic: ", "أرقام غير موجودة في الترجمة العربية: "),
-    ("glossary terms not marked: ", "مصطلحات من القاموس غير موسومة: "),
-]
-_STAGE_AR = {
-    "context pass": "مرحلة السياق",
-    "translation (quality models only)": "الترجمة (النماذج عالية الجودة فقط)",
-    "translation (lite last resort)": "الترجمة (نموذج lite كحل أخير)",
-    "review": "المراجعة",
-    "proofreading": "التدقيق اللغوي",
+_STAGE_EN = {
+    "context pass": "Context pass",
+    "translation (quality models only)": "Translation (quality models only)",
+    "translation (lite last resort)": "Translation (lite last resort)",
+    "review": "Review",
+    "quality pass": "Quality pass (review + proofreading merged)",
+    "proofreading": "Proofreading",
 }
 
 
-def reason_ar(r):
-    for en, ar in _REASON_AR:
-        if r.startswith(en):
-            return ar + r[len(en):]
-    return r
-
-
 def write_report(path, job, started):
-    lines = [f"تقرير الترجمة ({time.strftime('%Y-%m-%d %H:%M:%S')}، {(time.time() - started) / 60:.1f} دقيقة)",
-             f"نوع المدخل: {job.kind} | عدد الوحدات: {len(job.units)} | المجال: {job.brief.get('domain', '')}",
-             "الطلبات لكل نموذج: " + ("، ".join(f"{m}: {c}" for m, c in USED.most_common()) or "-"),
-             f"وحدات ما زالت مترجمة بنموذج احتياطي (lite): {sum(job.deg)}",
-             f"وحدات ترجمها Gemma ولم تُراجَع بعد: {sum(job.gem)}",
-             f"وحدات بقيت بالإنجليزية (فشلت ترجمتها): {sum(job.kept_en)}",
-             f"وحدات تمت مراجعتها: {len(job.reviewed)} "
-             f"(المعدَّلة منها: {sum(1 for v in job.reviewed.values() if v == 'changed')})",
-             "", "== تصحيحات التعرّف على الكلام التي رصدتها مرحلة السياق =="]
-    lines += [f"- {c.get('heard')} -> {c.get('meant')}" for c in job.brief.get("asr_corrections", [])] or ["(لا يوجد)"]
-    lines += ["", "== ملاحظات متبقية بعد المراجعة =="]
+    lines = [f"Translation report ({time.strftime('%Y-%m-%d %H:%M:%S')}, {(time.time() - started) / 60:.1f} min)",
+             f"Input type: {job.kind} | units: {len(job.units)} | domain: {job.brief.get('domain', '')}",
+             "Requests per model: " + (", ".join(f"{m}: {c}" for m, c in USED.most_common()) or "-"),
+             f"Units still translated by a fallback (lite) model: {sum(job.deg)}",
+             f"Units translated by Gemma and not yet reviewed: {sum(job.gem)}",
+             f"Units kept in English (translation failed): {sum(job.kept_en)}",
+             f"Units reviewed: {len(job.reviewed)} "
+             f"(revised: {sum(1 for v in job.reviewed.values() if v == 'changed')})",
+             "", "== Speech-recognition corrections noted by the context pass =="]
+    lines += [f"- {c.get('heard')} -> {c.get('meant')}" for c in job.brief.get("asr_corrections", [])] or ["(none)"]
+    lines += ["", "== Remaining notes after review =="]
     flagged = [(u, check_unit(job, u)) for u in job.units if job.ar[u["id"] - 1] is not None]
     flagged = [(u, r) for u, r in flagged if r]
     for u, r in flagged:
-        lines.append(f"- الوحدة {u['id']} (تبدأ بـ: {u['en'][:70]!r}): {'؛ '.join(reason_ar(x) for x in r)}")
+        lines.append(f"- Unit {u['id']} (starts with: {u['en'][:70]!r}): {'; '.join(r)}")
     if not flagged:
-        lines.append("(لا يوجد)")
-    lines += ["", "== سجل المراجعة =="] + (job.review_log or ["(لا يوجد)"])
-    lines += ["", "== التدقيق اللغوي ==",
-              f"التصحيحات المطبّقة: {job.proof_stats['applied']} | المرفوضة: {job.proof_stats['rejected']} "
-              f"| الدفعات الفاشلة: {job.proof_stats['failed_batches']}"] + job.proof_log[:300]
-    lines += ["", f"== مصطلحات وُسمت تلقائيًا (أضاف البرنامج الإنجليزية): {len(job.autotag_log)} =="] \
-        + (job.autotag_log or ["(لا يوجد)"])
-    lines += ["", "== التوقيت =="] + [f"{_STAGE_AR.get(n, n)}: {d / 60:.1f} دقيقة، {r} طلب" for n, d, r in TIMINGS]
+        lines.append("(none)")
+    lines += ["", "== Review log =="] + (job.review_log or ["(none)"])
+    lines += ["", "== Proofreading ==",
+              f"Corrections applied: {job.proof_stats['applied']} | rejected: {job.proof_stats['rejected']} "
+              f"| failed batches: {job.proof_stats['failed_batches']}"] + job.proof_log[:300]
+    lines += ["", f"== Terms tagged automatically (English added by the program): {len(job.autotag_log)} =="] \
+        + (job.autotag_log or ["(none)"])
+    lines += ["", f"== Glossary enforced by the program: {len(job.term_log)} change(s) =="] \
+        + (job.term_log[:100] or ["(none)"])
+    lines += ["", "== Glossary adherence (weakest first) =="] + term_adherence(job)
+    lines += [f"Hedged (dual-model) requests during congestion: {dict(HEDGE_STATS) or 0}"]
+    lines += ["", "== Timing =="] + [f"{_STAGE_EN.get(n, n)}: {d / 60:.1f} min, {r} request(s)" for n, d, r in TIMINGS]
     gused = {m: c for m, c in USED.items() if is_gemma(m)}
-    lines += [f"مستوى Gemma: الطلبات {dict(gused) or 0} | وحدات أُبقي عليها من Gemma بعد المراجعة: "
+    lines += [f"Gemma tier: requests {dict(gused) or 0} | Gemma units kept after review: "
               f"{sum(1 for k, m in enumerate(job.model) if is_gemma(m) and not job.gem[k])} "
-              f"| أخطاء 503 لكل نموذج: " + ("، ".join(f"{m}: {n}" for (m, c), n in sorted(ERRS.items()) if c == 503)
-                                          or "لا يوجد"),
-              "بدائل قدرات النماذج: " + ("؛ ".join(QUIRK_LOG) or "لا يوجد")]
-    lines += [f"الوقت المقضي في الانتظار/التأجيل (مجموع الخيوط): {WAIT[0] / 60:.1f} دقيقة",
-              "أخطاء HTTP لكل نموذج: " + ("، ".join(f"{m} HTTP {c}: {n}" for (m, c), n in sorted(ERRS.items()))
-                                         or "لا يوجد")]
+              f"| 503 errors per model: " + (", ".join(f"{m}: {n}" for (m, c), n in sorted(ERRS.items()) if c == 503)
+                                           or "none"),
+              "Model capability fallbacks: " + ("; ".join(QUIRK_LOG) or "none")]
+    lines += [f"Time spent waiting/backing off (summed over threads): {WAIT[0] / 60:.1f} min",
+              "HTTP errors per model: " + (", ".join(f"{m} HTTP {c}: {n}" for (m, c), n in sorted(ERRS.items()))
+                                          or "none")]
     redo = [u["id"] for u in job.units if job.ar[u["id"] - 1] is None or job.deg[u["id"] - 1]
             or job.gem[u["id"] - 1] or job.kept_en[u["id"] - 1]]
-    lines += ["", f"== وحدات تُعاد في التشغيل القادم (lite / إنجليزية / غير مترجمة): {len(redo)} ==", str(redo)]
-    lines += ["", f"== القاموس النهائي ({len(job.gloss)} مصطلح) =="]
+    lines += ["", f"== Units to redo on the next run (lite / English / untranslated): {len(redo)} ==", str(redo)]
+    lines += ["", f"== Final glossary ({len(job.gloss)} terms) =="]
     lines += [f"{en} = {ar}" for en, ar in job.gloss.values()]
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -1619,10 +1857,14 @@ def save_progress(path, job):
             "kept_en": list(job.kept_en), "reviewed": {str(k): v for k, v in job.reviewed.items()},
             "proofed": sorted(job.proofed),
         }
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-    os.replace(tmp, path)
+    with SAVE_LOCK:                       # parallel workers save too: serialize, never share a temp file
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except OSError as e:
+            print(f"  (checkpoint save failed: {e!r})")
 
 
 def load_progress(path, job):
@@ -1652,6 +1894,10 @@ def load_progress(path, job):
         return False
 
 
+def default_parallel():
+    return min(4, max(3, len(KEYS)))
+
+
 def main():
     try:
         sys.stdout.reconfigure(line_buffering=True)
@@ -1674,7 +1920,7 @@ def main():
         sys.exit("ERROR: no Gemini API key found (set GEMINI_API_KEY as a GitHub secret).")
 
     try:
-        minutes = float(os.environ.get("TRANSLATE_MAX_MINUTES", DEFAULT_MAX_MINUTES))
+        minutes = max(5.0, min(200.0, float(os.environ.get("TRANSLATE_MAX_MINUTES", DEFAULT_MAX_MINUTES))))
     except ValueError:
         minutes = DEFAULT_MAX_MINUTES
     START[0] = time.time()
@@ -1692,9 +1938,9 @@ def main():
             job.ar[u["id"] - 1] = ""
     words = sum(u["words"] for u in units)
     try:
-        PARALLEL[0] = max(1, min(8, int(os.environ.get("TRANSLATE_PARALLEL", min(3, len(KEYS))))))
+        PARALLEL[0] = max(1, min(8, int(os.environ.get("TRANSLATE_PARALLEL", default_parallel()))))
     except ValueError:
-        PARALLEL[0] = max(1, min(3, len(KEYS)))
+        PARALLEL[0] = default_parallel()
     print(f"Parsed {len(segments)} segments -> {len(units)} {'cues' if kind == 'srt' else 'paragraphs'} "
           f"({words} words). Keys: {len(KEYS)} | quality chain: {' -> '.join(build_chain(model))} "
           f"| gemma: {' -> '.join(gemma_chain()) if gemma_allowed() else 'off'} "
@@ -1702,6 +1948,7 @@ def main():
           f"| budget: {minutes:.0f} min | parallel: {PARALLEL[0]}")
 
     GATE.setup(PARALLEL[0])
+    HEALTH_CHAIN[:] = build_chain(model)
     progress_path = f"{prefix}_progress.json"
     PROGRESS_PATH[0] = progress_path
     resumed = load_progress(progress_path, job)
@@ -1764,7 +2011,7 @@ def main():
                 with LOCK:
                     PAUSE_UNTIL[0] = max(PAUSE_UNTIL[0], time.time() + wait)
                 try:
-                    _wait_pause(STAGE_END[0])
+                    _wait_pause(STAGE_END[0], force=True)
                 except ApiUnavailable:
                     pass
 
@@ -1780,12 +2027,9 @@ def main():
                 run_translation("Last-resort", False, True)
             job.lite_ok = False
 
-        with Stage("review"):
+        with Stage("quality pass"):
             set_stage_end("review")
-            review_pass(job)
-        with Stage("proofreading"):
-            set_stage_end("proof")
-            proofread_pass(job)
+            qa_pass(job)
     except ApiUnavailable as e:
         done = sum(1 for a in job.ar if a is not None)
         print(f"ERROR: {e}")
