@@ -5,7 +5,10 @@ name: Transcribe Audio
 # download_youtube_audio.py, translate_transcript.py) live at the repository root.
 #
 # Sources: a NotebookLM Audio Overview share link OR a single YouTube video link.
-# Optional secrets: GEMINI_API_KEY (translation), YOUTUBE_COOKIES (paste the
+# Optional secrets: GEMINI_API_KEY (translation; GEMINI_API_KEY_2 ... _5 are
+# optional extra keys that are rotated automatically - create each one in a
+# DIFFERENT Google Cloud project, free-tier quotas are per project, not per key),
+# YOUTUBE_COOKIES (paste the
 # text of a cookies.txt from a throwaway YouTube account; usually needed
 # because YouTube blocks GitHub's datacenter IPs). YOUTUBE_COOKIES_B64
 # (the same file base64-encoded) is also accepted.
@@ -66,6 +69,7 @@ on:
         type: choice
         options:
           - gemini-3.8-flash
+          - gemini-3.6-flash
           - gemini-3.7-flash
           - gemini-3.5-flash-lite
           - gemini-3.1-flash-lite
@@ -248,12 +252,21 @@ jobs:
         timeout-minutes: 150
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Optional extra keys (empty secrets are ignored by the script).
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
+          GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
+          GEMINI_API_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
           # Global time budget inside the script; on expiry a partial file is saved.
           TRANSLATE_MAX_MINUTES: '120'
           # Optional: medium (default) | low | high | off
           # GEMINI_THINKING_LEVEL: medium
-          # Optional: override the fallback chain (comma-separated)
-          # GEMINI_FALLBACK_MODELS: gemini-3.7-flash,gemini-3.5-flash-lite
+          # Optional: override the quality chain (comma-separated). Lite models are
+          # a last resort only (GEMINI_LAST_RESORT_MODELS) and their output is reviewed.
+          # GEMINI_FALLBACK_MODELS: gemini-3.6-flash,gemini-3.7-flash
+          # Optional: review model for suspect paragraphs ("off" disables) and its cap
+          # TRANSLATE_REVIEW_MODEL: gemini-3.1-pro-preview
+          # TRANSLATE_REVIEW_MAX: '15'
         run: |
           python translate_transcript.py \
             "$BASE_NAME.$OUTPUT_FORMAT" \
@@ -272,5 +285,7 @@ jobs:
           name: ${{ github.event.inputs.base_name }}
           path: |
             ${{ github.event.inputs.base_name }}*.${{ github.event.inputs.output_format }}
+            ${{ github.event.inputs.base_name }}_report.txt
+            ${{ github.event.inputs.base_name }}_progress.json
             debug_extract.png
           retention-days: 14
