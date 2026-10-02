@@ -9,9 +9,12 @@ name: Transcribe Audio
 # optional extra keys that are rotated automatically - create each one in a
 # DIFFERENT Google Cloud project, free-tier quotas are per project, not per key),
 # Resume: the Whisper transcript and the translation checkpoint are stored with
-# actions/cache (key = hash of link+format+model+name). Re-running the SAME link
-# restores them, skips download + transcription, and translates only what is
-# still missing (free-tier quotas reset at midnight Pacific time).
+# actions/cache (key = hash of the LINK ONLY). When reuse_previous is ticked
+# (off by default), re-running the SAME link restores them whatever name /
+# format / model you pick now, skips download + transcription, and translates
+# only what is still missing (free-tier quotas reset at midnight Pacific time).
+# The restored transcript keeps its original format and the output keeps the
+# name it was first created with (unless you type a different name).
 # YOUTUBE_COOKIES (paste the
 # text of a cookies.txt from a throwaway YouTube account; usually needed
 # because YouTube blocks GitHub's datacenter IPs). YOUTUBE_COOKIES_B64
@@ -53,7 +56,7 @@ on:
           - distil-large-v3
 
       reuse_previous:
-        description: 'Reuse the transcript + translation checkpoint of a previous run of the same link (skips transcription)'
+        description: 'Reuse the transcript + translation checkpoint of a previous run of the same link (skips transcription; name/format/model are taken from the previous run)'
         required: false
         default: false
         type: boolean
@@ -81,6 +84,11 @@ on:
           - gemini-3.6-flash
           - gemini-3.7-flash
           - gemini-3.5-flash
+      translate_max_minutes:
+        description: 'Translation time budget in minutes (global budget inside the script)'
+        required: false
+        default: '60'
+        type: string
 
 # Least privilege: this workflow only needs to read the repository.
 permissions:
@@ -153,8 +161,9 @@ jobs:
           fi
           echo "Audio source: $SOURCE"
           echo "SOURCE=$SOURCE" >> "$GITHUB_ENV"
-          KEY="$(printf '%s' "$CLEAN_URL|$OUTPUT_FORMAT|$MODEL_SIZE|$SAFE_NAME" | sha1sum | cut -c1-16)"
-          echo "TCACHE=transcribe-$KEY" >> "$GITHUB_ENV"
+          KEY="$(printf '%s' "$CLEAN_URL" | sha1sum | cut -c1-16)"
+          echo "TCACHE=transcribe-link-$KEY" >> "$GITHUB_ENV"
+          echo "FMT=$OUTPUT_FORMAT" >> "$GITHUB_ENV"
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -164,24 +173,42 @@ jobs:
         if: ${{ github.event.inputs.reuse_previous == 'true' }}
         uses: actions/cache/restore@v4
         with:
-          path: |
-            ${{ env.SAFE_NAME }}.${{ github.event.inputs.output_format }}
-            ${{ env.SAFE_NAME }}_progress.json
+          path: resume_cache
           key: ${{ env.TCACHE }}-${{ github.run_id }}
           restore-keys: |
             ${{ env.TCACHE }}-
 
+      # The cache holds fixed file names (resume_cache/transcript.<fmt>, meta.txt,
+      # progress.json) so it does not depend on the name/format chosen this time.
       - name: Decide whether transcription can be skipped
         env:
           MATCHED: ${{ steps.prev.outputs.cache-matched-key }}
+          NAME_TYPED: ${{ github.event.inputs.base_name }}
         run: |
-          if [[ -n "$MATCHED" && -s "$SAFE_NAME.$OUTPUT_FORMAT" ]]; then
-            echo "Restored transcript from cache ($MATCHED) - download and transcription are skipped."
-            ls -l "$SAFE_NAME"* || true
-            echo "HAVE_TRANSCRIPT=true" >> "$GITHUB_ENV"
-          else
-            echo "No previous transcript found - full run."
+          if [[ -n "$MATCHED" ]]; then
+            T="$(ls resume_cache/transcript.* 2>/dev/null | head -n1 || true)"
+            if [[ -n "$T" && -s "$T" ]]; then
+              PREV_FMT="${T##*.}"
+              PREV_NAME="$(sed -n 's/^name=//p' resume_cache/meta.txt 2>/dev/null | head -n1)"
+              # Keep the previous name unless a different one was typed this time.
+              if [[ -n "$PREV_NAME" && ( -z "$NAME_TYPED" || "$NAME_TYPED" == "transcript" ) ]]; then
+                SAFE_NAME="$PREV_NAME"
+              fi
+              cp "$T" "$SAFE_NAME.$PREV_FMT"
+              [[ -f resume_cache/progress.json ]] && cp resume_cache/progress.json "${SAFE_NAME}_progress.json"
+              echo "Restored transcript from cache ($MATCHED) - download and transcription are skipped."
+              echo "::notice::Reusing the previous transcript (format: $PREV_FMT, name: $SAFE_NAME)."
+              {
+                echo "HAVE_TRANSCRIPT=true"
+                echo "FMT=$PREV_FMT"
+                echo "SAFE_NAME=$SAFE_NAME"
+              } >> "$GITHUB_ENV"
+              ls -l "$SAFE_NAME"* || true
+              exit 0
+            fi
           fi
+          echo "No previous transcript found - full run."
+          rm -rf resume_cache
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -302,7 +329,7 @@ jobs:
       - name: Transcribe with faster-whisper
         if: ${{ env.HAVE_TRANSCRIPT != 'true' }}
         run: |
-          python transcribe.py "$AUDIO_FILE" "$SAFE_NAME.$OUTPUT_FORMAT" "$OUTPUT_FORMAT" "$MODEL_SIZE"
+          python transcribe.py "$AUDIO_FILE" "$SAFE_NAME.$FMT" "$FMT" "$MODEL_SIZE"
 
       - name: Translate to Arabic with Gemini
         if: ${{ github.event.inputs.translate == 'true' }}
@@ -315,7 +342,7 @@ jobs:
           GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
           GEMINI_API_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
           # Global time budget inside the script (stages get fixed shares of it).
-          TRANSLATE_MAX_MINUTES: '45'
+          TRANSLATE_MAX_MINUTES: ${{ github.event.inputs.translate_max_minutes }}
           # Optional: low (default) | medium | high | off
           # GEMINI_THINKING_LEVEL: low
           # Optional: max parallel requests (default min(3, number of keys))
@@ -327,21 +354,34 @@ jobs:
           # "off" disables) and the cap for non-lite suspects
           # TRANSLATE_REVIEW_MODEL: off
           # TRANSLATE_REVIEW_MAX: '15'
+          # Optional: Gemma 4 middle tier (used when Flash fails twice; always reviewed by Flash)
+          # TRANSLATE_GEMMA: off
+          # GEMMA_MODELS: gemma-4-31b-it,gemma-4-26b-a4b-it
         run: |
           python translate_transcript.py \
-            "$SAFE_NAME.$OUTPUT_FORMAT" \
+            "$SAFE_NAME.$FMT" \
             "$SAFE_NAME" \
             "$TRANSLATION_OUTPUT" \
             "$GEMINI_MODEL"
 
       # Keep transcript + checkpoint for the next run of the same link (also on failure).
-      - name: Save transcript and checkpoint for resume
+      - name: Prepare resume cache
+        id: pack
         if: ${{ always() && !cancelled() && env.TCACHE != '' }}
+        run: |
+          if [[ -s "$SAFE_NAME.$FMT" ]]; then
+            rm -rf resume_cache && mkdir resume_cache
+            cp "$SAFE_NAME.$FMT" "resume_cache/transcript.$FMT"
+            [[ -f "${SAFE_NAME}_progress.json" ]] && cp "${SAFE_NAME}_progress.json" resume_cache/progress.json
+            echo "name=$SAFE_NAME" > resume_cache/meta.txt
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save transcript and checkpoint for resume
+        if: ${{ always() && !cancelled() && steps.pack.outputs.ready == 'true' }}
         uses: actions/cache/save@v4
         with:
-          path: |
-            ${{ env.SAFE_NAME }}.${{ github.event.inputs.output_format }}
-            ${{ env.SAFE_NAME }}_progress.json
+          path: resume_cache
           key: ${{ env.TCACHE }}-${{ github.run_id }}
 
       - name: Flag incomplete translation
@@ -349,9 +389,9 @@ jobs:
         run: |
           REPORT="${SAFE_NAME}_report.txt"
           [[ -f "$REPORT" ]] || exit 0
-          N="$(grep -oP '== Units to redo on the next run[^:]*: \K[0-9]+' "$REPORT" || echo 0)"
+          N="$(grep -oP '== وحدات تُعاد في التشغيل القادم[^:]*: \K[0-9]+' "$REPORT" || echo 0)"
           if [[ "${N:-0}" -gt 0 ]]; then
-            echo "::warning::$N paragraph(s) are untranslated or came from a lite model. Run this workflow again with the SAME link after the Gemini daily quota resets (midnight Pacific time); only those paragraphs are redone."
+            echo "::warning::$N paragraph(s) are untranslated or came from a lite/Gemma model and were not reviewed. Run this workflow again with the SAME link after the Gemini daily quota resets (midnight Pacific time); only those paragraphs are redone."
             echo "### Translation incomplete: $N paragraph(s) pending - re-run with the same link after the quota reset." >> "$GITHUB_STEP_SUMMARY"
           fi
 
@@ -365,7 +405,7 @@ jobs:
         with:
           name: ${{ env.SAFE_NAME }}
           path: |
-            ${{ env.SAFE_NAME }}*.${{ github.event.inputs.output_format }}
+            ${{ env.SAFE_NAME }}*.${{ env.FMT }}
             ${{ env.SAFE_NAME }}_report.txt
             ${{ env.SAFE_NAME }}_progress.json
             debug_extract.png
