@@ -8,6 +8,10 @@ name: Transcribe Audio
 # Optional secrets: GEMINI_API_KEY (translation; GEMINI_API_KEY_2 ... _5 are
 # optional extra keys that are rotated automatically - create each one in a
 # DIFFERENT Google Cloud project, free-tier quotas are per project, not per key),
+# Resume: the Whisper transcript and the translation checkpoint are stored with
+# actions/cache (key = hash of link+format+model+name). Re-running the SAME link
+# restores them, skips download + transcription, and translates only what is
+# still missing (free-tier quotas reset at midnight Pacific time).
 # YOUTUBE_COOKIES (paste the
 # text of a cookies.txt from a throwaway YouTube account; usually needed
 # because YouTube blocks GitHub's datacenter IPs). YOUTUBE_COOKIES_B64
@@ -48,6 +52,11 @@ on:
           - large-v3-turbo
           - distil-large-v3
 
+      reuse_previous:
+        description: 'Reuse the transcript + translation checkpoint of a previous run of the same link (skips transcription)'
+        required: false
+        default: true
+        type: boolean
       translate:
         description: 'Translate transcript to Arabic with Gemini'
         required: false
@@ -71,9 +80,7 @@ on:
           - gemini-3.8-flash
           - gemini-3.6-flash
           - gemini-3.7-flash
-          - gemini-3.5-flash-lite
-          - gemini-3.1-flash-lite
-          - gemini-3.1-pro-preview
+          - gemini-3.5-flash
 
 # Least privilege: this workflow only needs to read the repository.
 permissions:
@@ -127,9 +134,35 @@ jobs:
           fi
           echo "Audio source: $SOURCE"
           echo "SOURCE=$SOURCE" >> "$GITHUB_ENV"
+          KEY="$(printf '%s' "$SHARE_URL|$OUTPUT_FORMAT|$MODEL_SIZE|$BASE_NAME" | sha1sum | cut -c1-16)"
+          echo "TCACHE=transcribe-$KEY" >> "$GITHUB_ENV"
 
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Restore previous transcript and translation checkpoint
+        id: prev
+        if: ${{ github.event.inputs.reuse_previous == 'true' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ github.event.inputs.base_name }}.${{ github.event.inputs.output_format }}
+            ${{ github.event.inputs.base_name }}_progress.json
+          key: ${{ env.TCACHE }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ env.TCACHE }}-
+
+      - name: Decide whether transcription can be skipped
+        env:
+          MATCHED: ${{ steps.prev.outputs.cache-matched-key }}
+        run: |
+          if [[ -n "$MATCHED" && -s "$BASE_NAME.$OUTPUT_FORMAT" ]]; then
+            echo "Restored transcript from cache ($MATCHED) - download and transcription are skipped."
+            ls -l "$BASE_NAME"* || true
+            echo "HAVE_TRANSCRIPT=true" >> "$GITHUB_ENV"
+          else
+            echo "No previous transcript found - full run."
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -137,16 +170,18 @@ jobs:
           python-version: '3.11'
 
       - name: Install ffmpeg and aria2
+        if: ${{ env.HAVE_TRANSCRIPT != 'true' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2
 
       - name: Install faster-whisper
+        if: ${{ env.HAVE_TRANSCRIPT != 'true' }}
         run: |
           pip install "faster-whisper>=1.2.1,<2"
 
       - name: Install Playwright (NotebookLM source)
-        if: ${{ env.SOURCE == 'notebooklm' }}
+        if: ${{ env.SOURCE == 'notebooklm' && env.HAVE_TRANSCRIPT != 'true' }}
         run: |
           pip install "playwright>=1.40,<2"
           playwright install --with-deps chromium
@@ -154,7 +189,7 @@ jobs:
       # YouTube breaks older yt-dlp builds quickly, so always take the latest.
       # "[default]" brings the yt-dlp-ejs challenge solver; it needs a JS runtime (Deno).
       - name: Install yt-dlp and Deno (YouTube source)
-        if: ${{ env.SOURCE == 'youtube' }}
+        if: ${{ env.SOURCE == 'youtube' && env.HAVE_TRANSCRIPT != 'true' }}
         run: |
           pip install -U "yt-dlp[default]"
           curl -fsSL https://deno.land/install.sh | sh
@@ -163,6 +198,7 @@ jobs:
           yt-dlp --version
 
       - name: Cache Whisper model
+        if: ${{ env.HAVE_TRANSCRIPT != 'true' }}
         uses: actions/cache@v4
         with:
           # faster-whisper downloads model weights via huggingface_hub,
@@ -175,7 +211,7 @@ jobs:
 
       # ---------------------------------------------------- source: NotebookLM
       - name: Extract direct audio URL from share link
-        if: ${{ env.SOURCE == 'notebooklm' }}
+        if: ${{ env.SOURCE == 'notebooklm' && env.HAVE_TRANSCRIPT != 'true' }}
         run: |
           python extract_audio_url.py "$SHARE_URL" "$RUNNER_TEMP/audio_url.txt"
           # The signed URL grants access to the audio: keep it out of the logs
@@ -183,7 +219,7 @@ jobs:
           echo "::add-mask::$(cat "$RUNNER_TEMP/audio_url.txt")"
 
       - name: Download audio from extracted direct link
-        if: ${{ env.SOURCE == 'notebooklm' }}
+        if: ${{ env.SOURCE == 'notebooklm' && env.HAVE_TRANSCRIPT != 'true' }}
         run: |
           # The captured googlevideo.com URL is signed/IP-locked and time-limited,
           # so a single-connection curl download was the main bottleneck for
@@ -208,7 +244,7 @@ jobs:
 
       # ------------------------------------------------------ source: YouTube
       - name: Download audio from YouTube
-        if: ${{ env.SOURCE == 'youtube' }}
+        if: ${{ env.SOURCE == 'youtube' && env.HAVE_TRANSCRIPT != 'true' }}
         env:
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
           YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
@@ -224,6 +260,7 @@ jobs:
 
       # ------------------------------------------------------------ common
       - name: Verify download
+        if: ${{ env.HAVE_TRANSCRIPT != 'true' }}
         run: |
           ls -lh "$AUDIO_FILE"
           SIZE=$(stat -c %s "$AUDIO_FILE")
@@ -244,6 +281,7 @@ jobs:
           fi
 
       - name: Transcribe with faster-whisper
+        if: ${{ env.HAVE_TRANSCRIPT != 'true' }}
         run: |
           python transcribe.py "$AUDIO_FILE" "$BASE_NAME.$OUTPUT_FORMAT" "$OUTPUT_FORMAT" "$MODEL_SIZE"
 
@@ -257,15 +295,18 @@ jobs:
           GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
           GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
           GEMINI_API_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
-          # Global time budget inside the script; on expiry a partial file is saved.
-          TRANSLATE_MAX_MINUTES: '120'
-          # Optional: medium (default) | low | high | off
-          # GEMINI_THINKING_LEVEL: medium
+          # Global time budget inside the script (stages get fixed shares of it).
+          TRANSLATE_MAX_MINUTES: '45'
+          # Optional: low (default) | medium | high | off
+          # GEMINI_THINKING_LEVEL: low
+          # Optional: max parallel requests (default min(3, number of keys))
+          # TRANSLATE_PARALLEL: '3'
           # Optional: override the quality chain (comma-separated). Lite models are
           # a last resort only (GEMINI_LAST_RESORT_MODELS) and their output is reviewed.
           # GEMINI_FALLBACK_MODELS: gemini-3.6-flash,gemini-3.7-flash
-          # Optional: review model for suspect paragraphs ("off" disables) and its cap
-          # TRANSLATE_REVIEW_MODEL: gemini-3.1-pro-preview
+          # Optional: review model for suspect paragraphs (default = quality chain;
+          # "off" disables) and the cap for non-lite suspects
+          # TRANSLATE_REVIEW_MODEL: off
           # TRANSLATE_REVIEW_MAX: '15'
         run: |
           python translate_transcript.py \
@@ -273,6 +314,27 @@ jobs:
             "$BASE_NAME" \
             "$TRANSLATION_OUTPUT" \
             "$GEMINI_MODEL"
+
+      # Keep transcript + checkpoint for the next run of the same link (also on failure).
+      - name: Save transcript and checkpoint for resume
+        if: ${{ always() && !cancelled() }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ github.event.inputs.base_name }}.${{ github.event.inputs.output_format }}
+            ${{ github.event.inputs.base_name }}_progress.json
+          key: ${{ env.TCACHE }}-${{ github.run_id }}
+
+      - name: Flag incomplete translation
+        if: ${{ always() && github.event.inputs.translate == 'true' }}
+        run: |
+          REPORT="${BASE_NAME}_report.txt"
+          [[ -f "$REPORT" ]] || exit 0
+          N="$(grep -oP '== Units to redo on the next run[^:]*: \K[0-9]+' "$REPORT" || echo 0)"
+          if [[ "${N:-0}" -gt 0 ]]; then
+            echo "::warning::$N paragraph(s) are untranslated or came from a lite model. Run this workflow again with the SAME link after the Gemini daily quota resets (midnight Pacific time); only those paragraphs are redone."
+            echo "### Translation incomplete: $N paragraph(s) pending - re-run with the same link after the quota reset." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       # Runs even if an earlier step failed, so the Whisper transcript, any
       # partial translation and the extraction screenshot (debug_extract.png,
