@@ -8,7 +8,7 @@ name: Transcribe Audio
 # v9 (free tier, <= 30 min): streaming + short first-token timeouts, per-model circuit
 # breaker, hedged requests while congested, merged review+proofreading pass, enforced glossary.
 # Tip: 503 peaks roughly 9:00-18:00 Pacific time; running outside those hours is faster.
-# Optional secrets: GEMINI_API_KEY (translation; GEMINI_API_KEY_2 ... _5 are
+# Optional secrets: MISTRAL_API_KEY, GROQ_API_KEY (backup providers, free keys), GEMINI_API_KEY (translation; GEMINI_API_KEY_2 ... _5 are
 # optional extra keys that are rotated automatically - create each one in a
 # DIFFERENT Google Cloud project, free-tier quotas are per project, not per key),
 # Resume: the Whisper transcript and the translation checkpoint are stored with
@@ -357,7 +357,14 @@ jobs:
           GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
           GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
           GEMINI_API_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
-          # Global time budget inside the script (stages get fixed shares of it).
+          # Optional backup providers (free keys). Empty/missing secret = that tier is skipped silently.
+          # Mistral's free Experiment plan may use requests for model training; Groq free is tightly
+          # rate-limited (small batches are used automatically). Output of these tiers is a draft:
+          # it is flagged and re-translated/reviewed by Gemini when available.
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          # TRANSLATE_BACKUP: off          # disable the backup tier entirely
+          # BACKUP_ORDER: mistral,groq     # preferred order (adapts to measured quality)          # Global time budget inside the script (stages get fixed shares of it).
           TRANSLATE_MAX_MINUTES: ${{ github.event.inputs.translate_max_minutes }}
           # Translation thinking: low (default) | medium | high | off
           # GEMINI_THINKING_LEVEL: low
