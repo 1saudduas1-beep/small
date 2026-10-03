@@ -78,6 +78,14 @@ Resilience
     * Truncated / blocked responses split the batch instead of blind retries.
     * Global deadline: partial output + checkpoint are saved on failure.
 
+OPTIONAL BACKUP PROVIDERS (free keys; absent key = tier silently disabled)
+    MISTRAL_API_KEY / GROQ_API_KEY   sit in the mid tier right after Gemma:
+        Gemini -> Gemma -> Mistral/Groq (best first, judged by the deterministic checks) -> lite.
+    Groq free limits (8K tokens/min, 200K/day, 1K requests/day) -> small batches + token limiter.
+    Mistral free tier may use requests for training; the key is optional for that reason.
+    Backup output is always a DRAFT: it is flagged, reviewed by Gemini when available, otherwise
+    redone on the next run. Review / proofreading always use Gemini.
+
 Environment variables
     GEMINI_API_KEY, GEMINI_API_KEY_2 ... GEMINI_API_KEY_8   (at least one)
     GEMINI_API_KEYS          comma-separated alternative to the above
@@ -88,6 +96,10 @@ Environment variables
     GEMMA_MODELS             override the Gemma tier (comma-separated; default gemma-4-31b-it,
                              gemma-4-26b-a4b-it)
     TRANSLATE_GEMMA          on (default) | off   (Gemma middle tier)
+    TRANSLATE_BACKUP         on (default) | off   (Mistral / Groq backup tier)
+    MISTRAL_MODELS / GROQ_MODELS   override backup models (default mistral-large-latest,
+                             mistral-medium-latest / openai/gpt-oss-120b,qwen/qwen3.8-27b)
+    BACKUP_ORDER             provider preference (default mistral,groq; adapts to measured quality)
     TRANSLATE_GEMMA_WORDS    English words per Gemma request (default 900)
     TRANSLATE_PARALLEL       max parallel requests (default: min(3, number of keys));
                              lowered automatically while models answer 503
@@ -167,6 +179,16 @@ GEMMA_RPM = 26               # requests per minute per key (limit 30)
 GEMMA_PATIENCE = 150         # seconds per Gemma request (all Gemma models)
 GEMMA_PREFER_SECS = 240      # after a Flash failure new batches try Gemma first for this long
 CONTEXT_PATIENCE = 240
+BK_URL = {"groq": "https://api.groq.com/openai/v1/chat/completions",
+          "mistral": "https://api.mistral.ai/v1/chat/completions"}
+BK_MODELS = {"groq": ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"],
+             "mistral": ["mistral-large-latest", "mistral-medium-latest"]}
+BK_LIMITS = {"groq": (6500, 26), "mistral": (400_000, 40)}   # (tokens/min, requests/min) with safety margins
+BK_GAP0 = {"groq": 2.2, "mistral": 1.3}                       # minimum seconds between requests (adaptive)
+BK_TPD = {"groq": 185_000}                                    # Groq free: 200K tokens/day
+BK_GROQ_WORDS = 480                                           # Groq free: 8K tokens/min -> small batches
+BK_PATIENCE = 150
+BK_TIMEOUT = 100
 RETRY_PAUSE = (12, 25)       # seconds to pause between translation rounds when all models are busy
 # share of the time budget at which each stage must be finished
 STAGE_FRAC = {"context": 0.15, "context_lite": 0.25, "translate": 0.55, "lite": 0.65, "review": 0.93, "proof": 0.95}
@@ -217,6 +239,18 @@ GEMMA_PREFER = [0.0]     # unix time until which new batches try Gemma before Fl
 GEMMA_PROBING = [False]  # True once Flash has failed: Flash is then probed with a single round
 GEMMA_WIN = {}           # key index -> [(time, tokens)] sliding window for the Gemma limits
 PROGRESS_PATH = [None]
+BK_KEYS = {}             # provider -> api key (only providers that have a key)
+BK_DEADP = {}            # provider -> reason (unusable for the rest of the run)
+BK_DEADM = set()         # (provider, model) not found
+BK_COOL = {}             # provider -> unix time (429 Retry-After)
+BK_GAP = {}              # provider -> current minimum gap between requests
+BK_LAST = {}
+BK_WIN = {}
+BK_DAY = Counter()       # estimated tokens used today per provider
+BK_RF = {}               # (provider, model) -> response_format level (0 strict, 1 json_schema, 2 json_object, 3 none)
+BK_NOREASON = set()
+BK_SCORE = {}            # provider -> [units, flagged]
+BK_LOG = []
 SAVE_LOCK = threading.Lock()
 LAST_OVERLOAD = [0.0]    # unix time of the last 503 / first-token timeout
 HEDGE_STATS = Counter()  # launched / second_won
@@ -315,6 +349,49 @@ def run_parallel(fn, items, workers, on_done):
 
 def is_gemma(model):
     return str(model).startswith("gemma")
+
+
+def is_mid(model):
+    m = str(model)
+    return m.startswith(("gemma", "mistral:", "groq:"))
+
+
+def bk_enabled():
+    return os.environ.get("TRANSLATE_BACKUP", "on").strip().lower() not in ("off", "none", "0")
+
+
+def bk_providers():
+    """Configured, usable providers ordered by measured quality (default: BACKUP_ORDER)."""
+    if not bk_enabled():
+        return []
+    base = [p.strip() for p in os.environ.get("BACKUP_ORDER", "mistral,groq").split(",") if p.strip()]
+    base += [p for p in BK_KEYS if p not in base]
+    live = [p for p in base if p in BK_KEYS and p not in BK_DEADP
+            and any((p, m) not in BK_DEADM for m in bk_models(p))]
+
+    def ratio(p):
+        n, bad = BK_SCORE.get(p, [0, 0])
+        return 0.5 if n < 4 else bad / n
+    return sorted(live, key=lambda p: (ratio(p), base.index(p)))
+
+
+def bk_models(p):
+    return env_list(p.upper() + "_MODELS", BK_MODELS[p])
+
+
+def mid_allowed():
+    return gemma_allowed() or bool(bk_providers())
+
+
+def mid_words():
+    if "groq" in bk_providers():
+        return BK_GROQ_WORDS
+    return GEMMA_WORDS
+
+
+def mid_names():
+    names = list(gemma_chain()) if gemma_allowed() else []
+    return names + [f"{p}:{'/'.join(bk_models(p))}" for p in bk_providers()]
 
 
 def gemma_chain():
@@ -788,6 +865,217 @@ def call_gemini(chain, system, user, schema=None, level="default", patience=None
     raise ApiUnavailable(f"all models failed: {last_err}")
 
 
+def to_json_schema(sc, root=True):
+    """Gemini-style schema (upper-case types) -> strict JSON Schema; an array root is wrapped in an object."""
+    if isinstance(sc, dict):
+        out = {}
+        t = sc.get("type")
+        if isinstance(t, str):
+            out["type"] = t.lower()
+        if "properties" in sc:
+            out["properties"] = {k: to_json_schema(v, False) for k, v in sc["properties"].items()}
+            out["required"] = list(sc["properties"].keys())
+            out["additionalProperties"] = False
+        if "items" in sc:
+            out["items"] = to_json_schema(sc["items"], False)
+        if "enum" in sc:
+            out["enum"] = sc["enum"]
+        if root and out.get("type") == "array":
+            return {"type": "object", "properties": {"items": out}, "required": ["items"],
+                    "additionalProperties": False}
+        return out
+    return sc
+
+
+def _bk_user(user, schema, level):
+    extra = "\n\nOUTPUT FORMAT: respond with ONLY valid JSON (no markdown fences, no commentary)."
+    if schema:
+        root_array = isinstance(schema, dict) and schema.get("type") == "ARRAY"
+        extra += (' Return a JSON object {"items": [ ... ]} where "items" is the array described above.'
+                  if root_array else "")
+        if level >= 2:
+            extra += " It must match this JSON schema:\n" + json.dumps(to_json_schema(schema), ensure_ascii=False)
+    return user + extra
+
+
+def _bk_body(prov, model, system, user, schema):
+    lvl = BK_RF.get((prov, model), 0)
+    body = {"model": model, "temperature": 0.2,
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": _bk_user(user, schema, lvl)}]}
+    if prov == "groq":
+        body["max_completion_tokens"] = 4096
+        if model.startswith("openai/gpt-oss") and (prov, model) not in BK_NOREASON:
+            body["reasoning_effort"] = "low"
+    else:
+        body["max_tokens"] = 16000
+    if schema and lvl <= 1:
+        body["response_format"] = {"type": "json_schema", "json_schema": {
+            "name": "result", "strict": lvl == 0, "schema": to_json_schema(schema)}}
+    elif lvl == 2:
+        body["response_format"] = {"type": "json_object"}
+    return body
+
+
+def _bk_post(prov, model, key, body):
+    req = urllib.request.Request(
+        BK_URL[prov], data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + key,
+                 "Accept": "application/json", "User-Agent": "translate-transcript/9 (+python-urllib)"})
+    with urllib.request.urlopen(req, timeout=BK_TIMEOUT) as resp:
+        out = json.loads(resp.read().decode("utf-8"))
+    cands = out.get("choices") or []
+    if not cands:
+        raise ValueError("no choices in response")
+    ch = cands[0]
+    if ch.get("finish_reason") == "length":
+        raise ResponseRejected("output truncated (length)")
+    msg = ch.get("message") or {}
+    text = msg.get("content") or ""
+    if isinstance(text, list):
+        text = "".join(p.get("text", "") for p in text if isinstance(p, dict))
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+    if not text:
+        raise ValueError(f"empty response (finish={ch.get('finish_reason')})")
+    tokens = int((out.get("usage") or {}).get("total_tokens") or 0)
+    return text, tokens
+
+
+def _bk_throttle(prov, tokens, stop_at):
+    """Sliding window (tokens + requests per minute) plus a minimum gap between requests."""
+    tpm, rpm = BK_LIMITS[prov]
+    tokens = min(tokens, tpm)
+    while True:
+        with LOCK:
+            now = time.time()
+            win = BK_WIN.setdefault(prov, [])
+            win[:] = [(t, n) for t, n in win if now - t < 60]
+            gap = BK_GAP.setdefault(prov, BK_GAP0[prov])
+            since = now - BK_LAST.get(prov, 0.0)
+            if since >= gap and (not win or (sum(n for _, n in win) + tokens <= tpm and len(win) < rpm)):
+                win.append((now, tokens))
+                BK_LAST[prov] = now
+                return
+            wait = (gap - since) if since < gap else (win[0][0] + 60 - now)
+        _sleep(min(max(wait, 0.3) + 0.2, 8), stop_at)
+
+
+def _bk_dead(prov, why):
+    with LOCK:
+        if prov not in BK_DEADP:
+            BK_DEADP[prov] = why
+            BK_LOG.append(f"{prov}: disabled for this run ({why})")
+            print(f"  backup {prov}: {why} -> disabled for this run")
+
+
+def call_backup(prov, system, user, schema=None, patience=BK_PATIENCE):
+    """OpenAI-compatible backup provider (Mistral / Groq). Returns (text, 'provider:model')."""
+    key = BK_KEYS.get(prov)
+    if not key or prov in BK_DEADP:
+        raise ApiUnavailable(f"{prov} not available")
+    stop_at = min(DEADLINE[0], time.time() + patience)
+    last = None
+    for model in bk_models(prov):
+        if (prov, model) in BK_DEADM:
+            continue
+        for attempt in range(1, 4):
+            _guard(stop_at)
+            if prov in BK_DEADP:
+                raise ApiUnavailable(f"{prov} disabled: {BK_DEADP[prov]}")
+            wait = BK_COOL.get(prov, 0) - time.time()
+            if wait > 0:
+                if time.time() + wait > stop_at:
+                    raise ApiUnavailable(f"{prov} rate-limited for {wait:.0f}s more")
+                _sleep(wait, stop_at)
+            body = _bk_body(prov, model, system, user, schema)
+            est = len(json.dumps(body, ensure_ascii=False)) // 3 * 2
+            _bk_throttle(prov, est, stop_at)
+            try:
+                text, tokens = _bk_post(prov, model, key, body)
+                with LOCK:
+                    USED[f"{prov}:{model}"] += 1
+                    BK_DAY[prov] += tokens or est
+                    BK_GAP[prov] = max(BK_GAP0[prov], BK_GAP.get(prov, BK_GAP0[prov]) * 0.9)
+                if BK_DAY[prov] >= BK_TPD.get(prov, 1 << 60):
+                    _bk_dead(prov, "daily token budget used")
+                return text, f"{prov}:{model}"
+            except ResponseRejected:
+                raise
+            except urllib.error.HTTPError as e:
+                raw = e.read().decode("utf-8", "ignore") if hasattr(e, "read") else ""
+                last = f"{prov}:{model} HTTP {e.code}: {raw[:140]}"
+                with LOCK:
+                    ERRS[(f"{prov}:{model}", e.code)] += 1
+                low = raw.lower()
+                if e.code in (401, 403):
+                    _bk_dead(prov, f"key rejected (HTTP {e.code})")
+                    raise ApiUnavailable(last)
+                if e.code == 404:
+                    BK_DEADM.add((prov, model))
+                    print(f"  backup {prov}:{model}: not found -> skipping model")
+                    break
+                if e.code == 413:
+                    raise ResponseRejected(f"{prov} request too large")
+                if e.code == 400:
+                    if "reasoning" in low and (prov, model) not in BK_NOREASON and "reasoning_effort" in body:
+                        BK_NOREASON.add((prov, model))
+                        BK_LOG.append(f"{prov}:{model}: reasoning_effort rejected -> off")
+                        continue
+                    lvl = BK_RF.get((prov, model), 0)
+                    if schema and lvl < 3:
+                        BK_RF[(prov, model)] = lvl + 1
+                        BK_LOG.append(f"{prov}:{model}: response_format level {lvl} rejected -> {lvl + 1}")
+                        print(f"  backup {prov}:{model}: response_format rejected (HTTP 400), degrading")
+                        continue
+                    break
+                if e.code == 429:
+                    try:
+                        delay = float(e.headers.get("retry-after")) if e.headers else None
+                    except (TypeError, ValueError):
+                        delay = None
+                    if delay is None:
+                        delay = _retry_delay(raw) or 2 ** attempt * 3
+                    perday = ("per day" in low or "tokens per day" in low or "(tpd)" in low
+                              or "daily" in low or delay > 300)
+                    if perday:
+                        _bk_dead(prov, "daily quota exhausted (HTTP 429)")
+                        raise ApiUnavailable(last)
+                    with LOCK:
+                        BK_COOL[prov] = time.time() + delay + random.uniform(0.5, 2)
+                        BK_GAP[prov] = min(30.0, max(BK_GAP.get(prov, BK_GAP0[prov]), BK_GAP0[prov]) * 2)
+                    continue
+                if e.code not in RETRYABLE_HTTP:
+                    break
+            except ApiUnavailable:
+                raise
+            except Exception as e:
+                last = f"{prov}:{model} {e!r}"
+            if attempt < 3:
+                print(f"  backup {prov}:{model} retry {attempt}/2 ({str(last)[:100]})")
+                _backoff(attempt, stop_at)
+    raise ApiUnavailable(f"{prov} unavailable: {last}")
+
+
+def call_mid(system, user, schema):
+    """Mid tier: Gemma first, then the backup providers (best measured quality first)."""
+    errs = []
+    if gemma_allowed():
+        try:
+            return call_gemini(gemma_chain(), system, user, schema, patience=GEMMA_PATIENCE, rounds=1)
+        except ApiUnavailable as e:
+            if e.fatal:
+                raise
+            errs.append(str(e)[:80])
+    for prov in bk_providers():
+        try:
+            return call_backup(prov, system, user, schema)
+        except ApiUnavailable as e:
+            if e.fatal:
+                raise
+            errs.append(str(e)[:80])
+    raise ApiUnavailable("mid tier unavailable: " + " | ".join(errs))
+
+
 def call_quality(primary, system, user, schema=None, level="default", rounds=None):
     """Quality chain only (no lite fallback). Returns (text, model, False)."""
     text, model = call_gemini(build_chain(primary), system, user, schema, level, QUALITY_PATIENCE, rounds)
@@ -939,7 +1227,7 @@ def _same_term(ar, std):
     return any(difflib.SequenceMatcher(None, x, y).ratio() >= 0.6 for x in a for y in b)
 
 
-def enforce_glossary(job, raw):
+def enforce_glossary(job, raw, counter=None):
     """A marked glossary term whose Arabic shares no word with the glossary rendering is replaced
     by the glossary Arabic (inflections that keep the stem are left alone)."""
     def repl(m):
@@ -955,12 +1243,14 @@ def enforce_glossary(job, raw):
             new = "ال" + std
         with job.lock:
             job.term_log.append(f"{en}: {ar} -> {new}")
+        if counter is not None:
+            counter[0] += 1
         return f"⟦{new}|{en}⟧"
     return MARK_RE.sub(repl, raw)
 
 
-def post_process(job, ar):
-    return swap_known_english(job, enforce_glossary(job, fix_marks(ar)))
+def post_process(job, ar, counter=None):
+    return swap_known_english(job, enforce_glossary(job, fix_marks(ar), counter))
 
 
 def term_adherence(job):
@@ -1145,6 +1435,13 @@ def build_brief(job):
                 except ApiUnavailable as e2:
                     if e2.fatal and not isinstance(e2, StageTimeUp):
                         raise
+            if text is None and "mistral" in bk_providers():
+                print("  trying Mistral for the context pass")
+                try:
+                    text, _ = call_backup("mistral", CONTEXT_SYSTEM, prompt, CONTEXT_SCHEMA, patience=180)
+                except (ApiUnavailable, ResponseRejected) as e3:
+                    if isinstance(e3, ApiUnavailable) and e3.fatal and not isinstance(e3, StageTimeUp):
+                        raise
             if text is None:
                 print("  using lite models for the context pass (weaker glossary)")
                 text, _, _ = call_tiered(job.primary, CONTEXT_SYSTEM, prompt, CONTEXT_SCHEMA, level=lvl)
@@ -1269,13 +1566,14 @@ def needs_work(job, k, redo):
 def gemma_fallback(job, pending):
     """Translate `pending` with Gemma in small batches. Returns the units still needing work."""
     todo = [u for u in pending if not (job.gem[u["id"] - 1] and job.ar[u["id"] - 1] is not None)]
-    if not todo or not gemma_allowed():
+    if not todo or not mid_allowed():
         return pending
     cap = GEMMA_MAX_UNITS[job.kind]
     try:
-        words = max(300, int(os.environ.get("TRANSLATE_GEMMA_WORDS", GEMMA_WORDS)))
+        words = max(300, int(os.environ.get("TRANSLATE_GEMMA_WORDS", mid_words())))
+        words = min(words, mid_words())
     except ValueError:
-        words = GEMMA_WORDS
+        words = mid_words()
     subs, cur, w = [], [], 0
     for u in todo:
         if cur and (len(cur) >= cap or w + u["words"] > words):
@@ -1285,15 +1583,15 @@ def gemma_fallback(job, pending):
         w += u["words"]
     if cur:
         subs.append(cur)
-    print(f"  Gemma tier: {len(todo)} unit(s) in {len(subs)} small request(s) "
-          f"({' -> '.join(gemma_chain())}); every Gemma unit is reviewed by Flash afterwards")
+    print(f"  Mid tier: {len(todo)} unit(s) in {len(subs)} small request(s) "
+          f"({' -> '.join(mid_names())}); every mid-tier unit is reviewed by Flash afterwards")
     for sub in subs:
         try:
             translate_batch(job, sub, gemma=True)
         except ApiUnavailable as e:
             if e.fatal:
                 raise
-            print(f"  Gemma unavailable too: {str(e)[:100]}")
+            print(f"  Mid tier unavailable too: {str(e)[:100]}")
             break
         if PROGRESS_PATH[0]:
             save_progress(PROGRESS_PATH[0], job)
@@ -1306,7 +1604,7 @@ def translate_batch(job, batch, gemma=False):
     system = SYSTEM_SRT if job.kind == "srt" else SYSTEM_TXT
     nb, na = CTX[job.kind]
     pending = list(batch)
-    if not gemma and gemma_allowed() and (job.lite_ok or time.time() < GEMMA_PREFER[0]):
+    if not gemma and mid_allowed() and (job.lite_ok or time.time() < GEMMA_PREFER[0]):
         pending = gemma_fallback(job, pending)      # Flash keeps failing: Gemma goes first for a while
         if not pending:
             return
@@ -1333,8 +1631,7 @@ def translate_batch(job, batch, gemma=False):
         )
         try:
             if gemma:
-                text, model = call_gemini(gemma_chain(), system, prompt, CHUNK_SCHEMA,
-                                          patience=GEMMA_PATIENCE, rounds=1)
+                text, model = call_mid(system, prompt, CHUNK_SCHEMA)
                 degraded = False
             elif job.lite_ok:
                 text, model, degraded = call_tiered(job.primary, system, prompt, CHUNK_SCHEMA)
@@ -1350,11 +1647,11 @@ def translate_batch(job, batch, gemma=False):
                                                          rounds=1 if GEMMA_PROBING[0] else None)
             result = clean_json(text)
         except ApiUnavailable as e:
-            if e.fatal or gemma or job.lite_ok or not gemma_allowed():
+            if e.fatal or gemma or job.lite_ok or not mid_allowed():
                 raise
             GEMMA_PROBING[0] = True
             GEMMA_PREFER[0] = time.time() + GEMMA_PREFER_SECS
-            print("  Flash chain failed -> Gemma tier takes over for these units")
+            print("  Flash chain failed -> mid tier (Gemma / backup) takes over for these units")
             pending = gemma_fallback(job, pending)
             if not pending:
                 return
@@ -1370,7 +1667,8 @@ def translate_batch(job, batch, gemma=False):
 
         got, problems = parse_items(result, pending)
         for i, ar in got.items():
-            ar = post_process(job, ar)
+            enforced = [0]
+            ar = post_process(job, ar, enforced)
             job.ar[i - 1] = ar
             job.kept_en[i - 1] = False
             job.reviewed.pop(i, None)
@@ -1380,6 +1678,13 @@ def translate_batch(job, batch, gemma=False):
             job.carry.discard(i - 1)
             job.model[i - 1] = model
             job.learn_terms(ar)
+            if model.startswith(("mistral:", "groq:")):
+                flags = [r for r in check_unit(job, job.units[i - 1])
+                         if not r.startswith(("translated by", "answered by"))]
+                with LOCK:
+                    sc = BK_SCORE.setdefault(model.split(":", 1)[0], [0, 0])
+                    sc[0] += 1
+                    sc[1] += 1 if (flags or enforced[0]) else 0
         pending = [u for u in pending if u["id"] not in got]
         if not pending:
             return
@@ -1484,7 +1789,7 @@ def check_unit(job, u):
     if job.deg[i]:
         reasons.append("answered by a fallback (lite) model")
     if job.gem[i]:
-        reasons.append("translated by Gemma (mid tier): check terminology, meaning, omissions and grammar")
+        reasons.append("translated by a mid-tier model (Gemma/Mistral/Groq): check terminology, meaning, omissions and grammar")
     ew, aw = wc(en), wc(plain)
     if ew >= 12:
         ratio = aw / ew
@@ -1735,7 +2040,7 @@ def qa_pass(job):
         job.review_log.append(f"Units still translated by a lite model after review: {left}")
     gleft = [u["id"] for u in job.units if job.gem[u["id"] - 1]]
     if gleft:
-        job.review_log.append(f"Gemma units not reviewed (will be re-translated by Flash on the next run): {gleft}")
+        job.review_log.append(f"Mid-tier units not reviewed (will be re-translated by Flash on the next run): {gleft}")
     st = job.proof_stats
     print(f"  proofreading: {st['applied']} correction(s) applied, {st['rejected']} rejected, "
           f"{st['failed_batches']} batch(es) failed; glossary enforced {len(job.term_log)} time(s)")
@@ -1806,7 +2111,7 @@ def write_report(path, job, started):
              f"Input type: {job.kind} | units: {len(job.units)} | domain: {job.brief.get('domain', '')}",
              "Requests per model: " + (", ".join(f"{m}: {c}" for m, c in USED.most_common()) or "-"),
              f"Units still translated by a fallback (lite) model: {sum(job.deg)}",
-             f"Units translated by Gemma and not yet reviewed: {sum(job.gem)}",
+             f"Units translated by the mid tier (Gemma/Mistral/Groq) and not yet reviewed: {sum(job.gem)}",
              f"Units kept in English (translation failed): {sum(job.kept_en)}",
              f"Units reviewed: {len(job.reviewed)} "
              f"(revised: {sum(1 for v in job.reviewed.values() if v == 'changed')})",
@@ -1831,8 +2136,13 @@ def write_report(path, job, started):
     lines += [f"Hedged (dual-model) requests during congestion: {dict(HEDGE_STATS) or 0}"]
     lines += ["", "== Timing =="] + [f"{_STAGE_EN.get(n, n)}: {d / 60:.1f} min, {r} request(s)" for n, d, r in TIMINGS]
     gused = {m: c for m, c in USED.items() if is_gemma(m)}
-    lines += [f"Gemma tier: requests {dict(gused) or 0} | Gemma units kept after review: "
-              f"{sum(1 for k, m in enumerate(job.model) if is_gemma(m) and not job.gem[k])} "
+    bused = {m: c for m, c in USED.items() if m.startswith(("mistral:", "groq:"))}
+    lines += ["Backup tier: configured " + (", ".join(sorted(BK_KEYS)) or "none") + f" | requests {dict(bused) or 0}"
+              + " | quality sample (flagged/units): "
+              + (", ".join(f"{p} {b}/{n}" for p, (n, b) in sorted(BK_SCORE.items())) or "-"),
+              "Backup notes: " + ("; ".join(BK_LOG) or "none")]
+    lines += [f"Gemma tier: requests {dict(gused) or 0} | mid-tier units kept after review: "
+              f"{sum(1 for k, m in enumerate(job.model) if is_mid(m) and not job.gem[k])} "
               f"| 503 errors per model: " + (", ".join(f"{m}: {n}" for (m, c), n in sorted(ERRS.items()) if c == 503)
                                            or "none"),
               "Model capability fallbacks: " + ("; ".join(QUIRK_LOG) or "none")]
@@ -1916,6 +2226,10 @@ def main():
         sys.exit("ERROR: mode must be arabic, bilingual or both.")
 
     KEYS[:] = load_keys()
+    for _p in ("groq", "mistral"):
+        _k = os.environ.get(_p.upper() + "_API_KEY", "").strip()
+        if _k:
+            BK_KEYS[_p] = _k
     if not KEYS:
         sys.exit("ERROR: no Gemini API key found (set GEMINI_API_KEY as a GitHub secret).")
 
@@ -1944,6 +2258,7 @@ def main():
     print(f"Parsed {len(segments)} segments -> {len(units)} {'cues' if kind == 'srt' else 'paragraphs'} "
           f"({words} words). Keys: {len(KEYS)} | quality chain: {' -> '.join(build_chain(model))} "
           f"| gemma: {' -> '.join(gemma_chain()) if gemma_allowed() else 'off'} "
+          f"| backup: {', '.join(bk_providers()) or 'off'} "
           f"| last resort: {' -> '.join(last_resort_chain())} | thinking: {get_thinking_level() or 'default'} "
           f"| budget: {minutes:.0f} min | parallel: {PARALLEL[0]}")
 
@@ -2057,7 +2372,7 @@ def main():
     if incomplete:
         save_progress(progress_path, job)
         n = sum(1 for k in range(len(units)) if job.ar[k] is None or job.deg[k] or job.gem[k] or job.kept_en[k])
-        print(f"INCOMPLETE: {n} unit(s) are untranslated, came from a lite model or are unreviewed Gemma output "
+        print(f"INCOMPLETE: {n} unit(s) are untranslated, came from a lite model or are unreviewed mid-tier output "
               f"(listed in the report). "
               f"Checkpoint kept: {progress_path} - commit it and run again after the daily quota resets "
               f"(midnight Pacific time); only those units will be redone.")
