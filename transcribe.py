@@ -1,7 +1,10 @@
 """
 Transcribes an audio file using faster-whisper (English only) and writes
 the result as either:
-  - srt: numbered, timed cues (one per Whisper segment) for video players
+  - srt: numbered, timed cues for video players. Cues are built from WORD
+         timestamps, so every cue starts when its first word is spoken and
+         ends when its last word ends (timing follows the speech; a cue never
+         waits for a sentence to finish)
   - txt: numbered COMPLETE SENTENCES, no timestamps (one sentence per entry)
 
 Segments are written to disk as soon as they are decoded (so progress is
@@ -13,6 +16,13 @@ Usage:
     format:     "srt" (default) or "txt"
     model_size: "tiny", "base", "small" (default), "medium", "large-v2",
                 "large-v3", "large-v3-turbo", "distil-large-v3"
+
+srt cue rules (word-timestamp based):
+    * A cue is closed at a pause between words (>= PAUSE_BREAK_SECONDS), when
+      it reaches MAX_CUE_SECONDS / MAX_CUE_CHARS, or at a comma / sentence end
+      once it is long enough (SOFT_BREAK_*). Cues never overlap.
+    * If a segment has no word timestamps, its text is spread over the
+      segment duration in proportion to character count.
 
 txt sentence rules:
     * Whisper segments are merged / split so every entry ends at a sentence
@@ -39,6 +49,18 @@ VALID_FORMATS = {"srt", "txt"}
 MAX_CONSECUTIVE_REPEATS = 3
 
 MAX_SENTENCE_CHARS = 300
+
+# ---- srt cue building (time-proportional, word-timestamp based)
+PAUSE_BREAK_SECONDS = 0.45     # silence between two words that closes the cue
+MAX_CUE_SECONDS = 5.0          # hard cap on cue duration
+MAX_CUE_CHARS = 80             # hard cap on cue length (one comfortable line pair)
+SOFT_MIN_SECONDS = 1.0         # a sentence end closes the cue once it lasts this long
+SOFT_COMMA_SECONDS = 2.0       # a comma / ; : closes the cue once it lasts this long
+SOFT_COMMA_CHARS = 45          # ...or once it has this many characters
+END_HOLD_SECONDS = 0.12        # small hold after the last word (clipped to next cue)
+MIN_CUE_SECONDS = 0.30         # shortest displayed cue (clipped to next cue)
+CLAUSE_END_RE = re.compile(r"[,;:\u060c\u061b][\"'\u201d\u2019\u00bb)\]]*$")
+SENT_END_RE = re.compile(r"[.?!\u061f\u06d4\u2026][\"'\u201d\u2019\u00bb)\]]*$")
 
 # A terminator run (. ? ! … ؟ ۔) or a single : ; ؛, then optional closing
 # quotes/brackets, and only if followed by whitespace or the end of the text
@@ -69,6 +91,110 @@ def format_entry(fmt: str, number: int, start: float, end: float, text: str) -> 
         end = max(end, start)
         return f"{number}\n{format_timestamp(start)} --> {format_timestamp(end)}\n{text}\n\n"
     return f"{number}\n{text}\n\n"
+
+
+# --------------------------------------------------------------------- cues
+def _segment_words(segment):
+    """[(start, end, text)] for a segment: real word timings when available,
+    else the segment text spread over its duration in proportion to characters."""
+    out = []
+    for w in (getattr(segment, "words", None) or []):
+        t = (w.word or "").strip()
+        if t:
+            out.append((float(w.start), float(w.end), t))
+    if out:
+        return out
+    tokens = segment.text.split()
+    if not tokens:
+        return []
+    start, end = float(segment.start), float(segment.end)
+    span = max(end - start, 0.0)
+    total = sum(len(t) for t in tokens) or 1
+    pos = start
+    for t in tokens:
+        step = span * len(t) / total
+        out.append((pos, pos + step, t))
+        pos += step
+    return out
+
+
+class CueBuilder:
+    """Streaming builder: feed() words with their own timings, get timed cues
+    back as (start, end, text). A cue starts at its first word's start and ends
+    at its last word's end, so subtitles follow the speech instead of waiting
+    for a sentence to complete."""
+
+    def __init__(self):
+        self.words = []          # [(start, end, text)]
+        self.last_end = 0.0      # end of the last closed cue (no-overlap guard)
+        self.hold = None         # last closed cue, held back one step to absorb orphans
+
+    def _chars(self, extra: str = "") -> int:
+        n = sum(len(w[2]) for w in self.words) + max(len(self.words) - 1, 0)
+        return n + (1 + len(extra) if self.words else len(extra))
+
+    def _close(self, next_start=None):
+        if not self.words:
+            return None
+        start = max(self.words[0][0], self.last_end)
+        end = max(self.words[-1][1], start)
+        end = max(end + END_HOLD_SECONDS, start + MIN_CUE_SECONDS) if end - start < MIN_CUE_SECONDS \
+            else end + END_HOLD_SECONDS
+        if next_start is not None:
+            end = min(end, max(next_start, start))
+        text = re.sub(r"\s+", " ", " ".join(w[2] for w in self.words)).strip()
+        self.words = []
+        self.last_end = end
+        return (start, end, text) if text else None
+
+    def _push(self, cue, out):
+        """Hold each closed cue one step; a 1-2 word / <1 s orphan that follows
+        without a pause is merged into the held cue instead of standing alone."""
+        h = self.hold
+        if h and cue:
+            n_words = len(cue[2].split())
+            joined = h[2] + " " + cue[2]
+            if (n_words <= 2 and cue[1] - cue[0] < 1.0 and cue[0] - h[1] <= 0.2
+                    and len(joined) <= MAX_CUE_CHARS + 15
+                    and cue[1] - h[0] <= MAX_CUE_SECONDS + 1.0):
+                self.hold = (h[0], cue[1], joined)
+                return
+        if h:
+            out.append(h)
+        self.hold = cue
+
+    def feed(self, words):
+        out = []
+        for ws, we, wt in words:
+            ws = max(ws, self.words[-1][1] if self.words else self.last_end)
+            we = max(we, ws)
+            if self.words:
+                gap = ws - self.words[-1][1]
+                dur_with = we - self.words[0][0]
+                if (gap >= PAUSE_BREAK_SECONDS
+                        or dur_with > MAX_CUE_SECONDS
+                        or self._chars(wt) > MAX_CUE_CHARS):
+                    self._push(self._close(next_start=ws), out)
+            self.words.append((ws, we, wt))
+            dur = we - self.words[0][0]
+            if SENT_END_RE.search(wt) and dur >= SOFT_MIN_SECONDS:
+                pass_break = True
+            elif CLAUSE_END_RE.search(wt) and (dur >= SOFT_COMMA_SECONDS
+                                               or self._chars() >= SOFT_COMMA_CHARS):
+                pass_break = True
+            else:
+                pass_break = False
+            if pass_break:
+                self._push(self._close(), out)
+        return out
+
+    def flush(self):
+        out = []
+        self._push(self._close(), out)
+        if self.hold:
+            out.append(self.hold)
+            self.hold = None
+        return out
 
 
 # ---------------------------------------------------------------- sentences
@@ -193,6 +319,9 @@ def main():
         beam_size=5,
         vad_filter=True,  # skip silence, useful for AI-generated podcasts
         vad_parameters={"min_silence_duration_ms": 500},
+        # srt: per-word timings drive the cues (time-proportional subtitles).
+        word_timestamps=(output_format == "srt"),
+        hallucination_silence_threshold=(2.0 if output_format == "srt" else None),
         # Feeding the previous text back in is the main cause of repetition
         # loops / hallucination drift in long audio; each segment is
         # decoded independently instead.
@@ -203,6 +332,7 @@ def main():
     print(f"Detected duration: {duration:.1f}s")
 
     splitter = SentenceSplitter(MAX_SENTENCE_CHARS) if output_format == "txt" else None
+    cues = CueBuilder() if output_format == "srt" else None
     count = 0
     skipped_repeats = 0
     last_text = None
@@ -236,7 +366,8 @@ def main():
                 for sentence in splitter.feed(text):
                     emit(0.0, 0.0, sentence)
             else:
-                emit(segment.start, segment.end, text)
+                for c_start, c_end, c_text in cues.feed(_segment_words(segment)):
+                    emit(c_start, c_end, c_text)
 
             pct = min(100.0, segment.end / duration * 100) if duration > 0 else 0.0
             print(f"  [{pct:5.1f}%] [{format_timestamp(segment.start)}] {text}")
@@ -244,6 +375,9 @@ def main():
         if splitter:
             for sentence in splitter.flush():
                 emit(0.0, 0.0, sentence)
+        if cues:
+            for c_start, c_end, c_text in cues.flush():
+                emit(c_start, c_end, c_text)
 
     if count == 0:
         print("ERROR: no speech segments were produced.", file=sys.stderr)
@@ -251,7 +385,7 @@ def main():
 
     if skipped_repeats:
         print(f"Note: dropped {skipped_repeats} repeated segment(s) (likely hallucination loops).")
-    unit = "sentences" if splitter else "segments"
+    unit = "sentences" if splitter else "cues"
     print(f"Done. Wrote {count} {unit} to '{output_path}' (format={output_format}).")
 
 
