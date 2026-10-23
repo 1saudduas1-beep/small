@@ -52,7 +52,7 @@ v9 - SPEED + QUALITY (free tier, target <= 30 min)
       quality pass, anything left is redone on the next run.
 
 Resilience
-    * Quality chain (3.8 -> 3.6 -> 3.7). HTTP 503 means the MODEL is overloaded,
+    * Quality chain (3.8 -> 3.6 -> 3 -> 2.5). HTTP 503 means the MODEL is overloaded,
       not the key: no key rotation, the request moves to the next model at once.
       After 2 consecutive failures a model is demoted (tried last) for 10 minutes.
       Only if the whole chain fails do the "last resort" lite models answer, and
@@ -91,6 +91,9 @@ Environment variables
     GEMINI_API_KEYS          comma-separated alternative to the above
     GEMINI_FALLBACK_MODELS   override the quality chain (comma-separated)
     GEMINI_LAST_RESORT_MODELS override the last-resort models
+    TRANSLATE_FAST           off (default) | on   ("fast": Lite models only for every stage - translation,
+                             context, review, proofreading; Gemma and backup tiers are disabled;
+                             GEMINI_FAST_MODELS overrides the Lite list, default = the last-resort models)
     GEMINI_THINKING_LEVEL    low (default, translation) | medium | high | off
                              (context pass and review always use high)
     GEMMA_MODELS             override the Gemma tier (comma-separated; default gemma-4-31b-it,
@@ -147,7 +150,10 @@ SRT_CHUNK_CUES = 40
 CTX = {"txt": (2, 1), "srt": (6, 3)}   # (units before, units after) given as context
 
 DEFAULT_MODEL = "gemini-3.8-flash"
-QUALITY_CHAIN = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.5-flash"]
+# Only Flash models with free-tier quota on this project (AI Studio rate-limit page, 2026-10-23):
+# 3.8 / 3.6 / 3 / 2.5 Flash = 5 RPM, 250K TPM, 20 RPD each. gemini-3.7-flash and gemini-3.5-flash
+# have no listed quota, so they are no longer in the chain.
+QUALITY_CHAIN = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3-flash-preview", "gemini-2.5-flash"]
 LAST_RESORT = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 DEFAULT_REVIEW_MODEL = ""          # empty = use the quality chain (free tier has no pro quota)
 
@@ -356,7 +362,14 @@ def is_mid(model):
     return m.startswith(("gemma", "mistral:", "groq:"))
 
 
+def fast_mode():
+    """"Fast" option: Lite models only (translation, context, review, proofreading); no Flash, Gemma or backup tier."""
+    return os.environ.get("TRANSLATE_FAST", "off").strip().lower() in ("on", "true", "1", "yes")
+
+
 def bk_enabled():
+    if fast_mode():
+        return False
     return os.environ.get("TRANSLATE_BACKUP", "on").strip().lower() not in ("off", "none", "0")
 
 
@@ -399,6 +412,8 @@ def gemma_chain():
 
 
 def gemma_allowed():
+    if fast_mode():
+        return False
     if os.environ.get("TRANSLATE_GEMMA", "on").strip().lower() in ("off", "none", "0"):
         return False
     return chain_alive(gemma_chain())
@@ -492,6 +507,8 @@ def load_keys():
 
 
 def build_chain(primary):
+    if fast_mode():
+        return env_list("GEMINI_FAST_MODELS", LAST_RESORT)
     chain = [primary]
     for m in env_list("GEMINI_FALLBACK_MODELS", QUALITY_CHAIN):
         if m not in chain:
@@ -500,6 +517,8 @@ def build_chain(primary):
 
 
 def last_resort_chain():
+    if fast_mode():
+        return build_chain(None)
     return env_list("GEMINI_LAST_RESORT_MODELS", LAST_RESORT)
 
 
@@ -1278,14 +1297,14 @@ def term_adherence(job):
     return [head] + out
 
 
-def render_text(text, seen):
-    """⟦ar|en⟧ -> 'ar (en)' on the first appearance of `en`, else 'ar'."""
+def render_text(text, seen, en_paren=True):
+    """⟦ar|en⟧ -> 'ar (en)' on the first appearance of `en`, else 'ar' (always 'ar' when en_paren is False)."""
     def repl(m):
         ar, en = m.group(1).strip(), m.group(2).strip()
         if not ar:
             return en
         key = en.lower()
-        if not LATIN_RE.search(en) or key in seen:
+        if not en_paren or not LATIN_RE.search(en) or key in seen:
             return ar
         seen.add(key)
         if re.match(r"\s*\(\s*[A-Za-z]", m.string[m.end():m.end() + 40]):
@@ -1475,7 +1494,8 @@ SYSTEM_TXT = SYSTEM_COMMON + """
 8. Each item is a whole PARAGRAPH of the lecture: translate it into ONE flowing Arabic paragraph (several sentences are fine). Join short interjections of the second speaker naturally into the flow."""
 
 SYSTEM_SRT = SYSTEM_COMMON + """
-8. Each item is ONE subtitle cue, often a fragment that starts or ends mid-sentence. Keep a strict 1:1 alignment: translate the fragment as the matching fragment of the Arabic sentence, keep each cue short, and move no content between cues beyond what Arabic word order forces. A short interjection ("Yeah.", "Right.") gets a short natural Arabic equivalent."""
+8. Each item is ONE subtitle cue, often a fragment that starts or ends mid-sentence. Keep a strict 1:1 alignment: translate the fragment as the matching fragment of the Arabic sentence, keep each cue short, and move no content between cues beyond what Arabic word order forces. A short interjection ("Yeah.", "Right.") gets a short natural Arabic equivalent.
+9. ARABIC ONLY (video subtitles): write every word in Arabic letters, with no Latin letters at all and nothing kept in English. Acronyms, person names, brand names and drug names are written in Arabic transliteration as the arabic part of the markup, e.g. ⟦في دبليو إف|VWF⟧. The English part of the markup is for the program only and is never shown."""
 
 CHUNK_SCHEMA = {
     "type": "ARRAY",
@@ -1504,6 +1524,8 @@ def glossary_text(job, only_for=None):
 
 
 def keep_text(job):
+    if job.kind == "srt":        # video subtitles: nothing is kept in English
+        return "(none)"
     return ", ".join(str(x) for x in job.brief.get("keep_english", []) if x) or "(none)"
 
 
@@ -1770,6 +1792,8 @@ def number_in_words(num, plain):
 
 def keep_words(job):
     out = set()
+    if job.kind == "srt":        # video subtitles: nothing is kept in English
+        return out
     for x in job.brief.get("keep_english", []):
         out |= {w.lower() for w in re.findall(r"[A-Za-z][A-Za-z'-]*", str(x))}
     return out
@@ -2075,8 +2099,11 @@ def autotag_terms(job, rendered, seen):
 def render_all(job):
     seen, out = set(), []
     for i, u in enumerate(job.units):
-        out.append(render_text(job.ar[i], seen) if job.ar[i] is not None else u["en"])
-    autotag_terms(job, out, seen)
+        out.append(render_text(job.ar[i], seen, job.kind != "srt") if job.ar[i] is not None else u["en"])
+    if job.kind == "srt":        # video subtitles: Arabic only, no English in parentheses
+        job.autotag_log = []
+    else:
+        autotag_terms(job, out, seen)
     return out
 
 
