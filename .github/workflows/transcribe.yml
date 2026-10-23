@@ -85,8 +85,13 @@ on:
         options:
           - gemini-3.8-flash
           - gemini-3.6-flash
-          - gemini-3.7-flash
-          - gemini-3.5-flash
+          - gemini-3-flash-preview
+          - gemini-2.5-flash
+      fast:
+        description: 'أسرع (Faster): use Lite models only (Gemini Flash-Lite) for every translation stage; no Flash, Gemma or backup models. Lower quality, much larger daily quota'
+        required: false
+        default: false
+        type: boolean
       translate_max_minutes:
         description: 'Translation time budget in minutes, 10-200 (set it higher for long audio; the step timeout follows it automatically)'
         required: false
@@ -352,6 +357,7 @@ jobs:
         timeout-minutes: 220
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TRANSLATE_FAST: ${{ github.event.inputs.fast == 'true' && 'on' || 'off' }}
           # Optional extra keys (empty secrets are ignored by the script).
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
           GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
@@ -374,7 +380,7 @@ jobs:
           # TRANSLATE_PARALLEL: '4'   (default 4; lowered automatically on 503, restored after successes)
           # Optional: override the quality chain (comma-separated). Lite models are
           # a last resort only (GEMINI_LAST_RESORT_MODELS) and their output is reviewed.
-          # GEMINI_FALLBACK_MODELS: gemini-3.6-flash,gemini-3.7-flash
+          # GEMINI_FALLBACK_MODELS: gemini-3.6-flash,gemini-3-flash-preview,gemini-2.5-flash
           # Optional: review model for suspect paragraphs (default = quality chain;
           # "off" disables) and the cap for non-lite suspects
           # TRANSLATE_REVIEW_MODEL: off
