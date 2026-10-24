@@ -6,7 +6,7 @@ Usage:
     python download_youtube_video.py <youtube_url> <output_stem> <result_file> [max_height]
 
     The video is saved as <output_stem>.mp4 and its file name is written to
-    <result_file>. max_height (default 720) caps the resolution: the best
+    <result_file>. max_height (default 240) caps the resolution: the best
     available stream up to that height is used, H.264/AAC preferred so the file
     plays on any phone.
 
@@ -27,7 +27,7 @@ import time
 
 import download_youtube_audio as base
 
-DEFAULT_HEIGHT = 720
+DEFAULT_HEIGHT = 240
 ALLOWED_HEIGHTS = (144, 240, 360, 480, 720, 1080, 1440, 2160)
 DEFAULT_MAX_MB = 1500
 
