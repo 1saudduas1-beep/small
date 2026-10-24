@@ -86,7 +86,6 @@ on:
           - gemini-3.8-flash
           - gemini-3.6-flash
           - gemini-3-flash-preview
-          - gemini-2.5-flash
       clean_audio:
         description: 'srt only: isolate the voice from music / songs / noise (Demucs) before transcribing. Slower (about the video length) but far better with background music'
         required: false
@@ -375,6 +374,15 @@ jobs:
 
       # srt only. Isolates the voice (Demucs "vocals" stem) so music, songs and noise do
       # not hide speech. Best effort: on any failure the original audio is used.
+      - name: Cache Demucs wheels and model
+        if: ${{ env.HAVE_TRANSCRIPT != 'true' && env.FMT == 'srt' && env.CLEAN_AUDIO == 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/torch
+          key: demucs-cpu-htdemucs-v1
+
       - name: Isolate voice from music and noise (Demucs)
         if: ${{ env.HAVE_TRANSCRIPT != 'true' && env.FMT == 'srt' && env.CLEAN_AUDIO == 'true' }}
         continue-on-error: true
@@ -382,7 +390,7 @@ jobs:
           pip install --quiet torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
           pip install --quiet demucs==4.0.1 soundfile "numpy<2"
           rm -rf demucs_out
-          python -m demucs --two-stems=vocals -n htdemucs -d cpu -j 2 -o demucs_out "$AUDIO_FILE"
+          python -m demucs --two-stems=vocals -n htdemucs -d cpu -j 2 --overlap 0.1 -o demucs_out "$AUDIO_FILE"
           VOCALS="$(find demucs_out -name vocals.wav | head -n 1)"
           test -n "$VOCALS"
           # The cleaned track must last EXACTLY as long as the original so cue times match the audio.
@@ -445,7 +453,7 @@ jobs:
           # TRANSLATE_PARALLEL: '4'   (default 4; lowered automatically on 503, restored after successes)
           # Optional: override the quality chain (comma-separated). Lite models are
           # a last resort only (GEMINI_LAST_RESORT_MODELS) and their output is reviewed.
-          # GEMINI_FALLBACK_MODELS: gemini-3.6-flash,gemini-3-flash-preview,gemini-2.5-flash
+          # GEMINI_FALLBACK_MODELS: gemini-3.6-flash,gemini-3-flash-preview
           # Optional: review model for suspect paragraphs (default = quality chain;
           # "off" disables) and the cap for non-lite suspects
           # TRANSLATE_REVIEW_MODEL: off
