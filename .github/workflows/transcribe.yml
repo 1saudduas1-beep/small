@@ -87,6 +87,31 @@ on:
           - gemini-3.6-flash
           - gemini-3-flash-preview
           - gemini-2.5-flash
+      clean_audio:
+        description: 'srt only: isolate the voice from music / songs / noise (Demucs) before transcribing. Slower (about the video length) but far better with background music'
+        required: false
+        default: true
+        type: boolean
+      speakers:
+        description: 'srt only: detect different speakers; a cue with two speakers is written as two lines, each starting with a dash (-)'
+        required: false
+        default: true
+        type: boolean
+      save_video:
+        description: 'YouTube links only: also save the VIDEO (.mp4) as a separate downloadable file in the run artifacts (no zip, plays on a phone)'
+        required: false
+        default: false
+        type: boolean
+      video_quality:
+        description: 'Max video height when save_video is ticked (lower = smaller file)'
+        required: false
+        default: '720'
+        type: choice
+        options:
+          - '360'
+          - '480'
+          - '720'
+          - '1080'
       fast:
         description: 'أسرع (Faster): use Lite models only (Gemini Flash-Lite) for every translation stage; no Flash, Gemma or backup models. Lower quality, much larger daily quota'
         required: false
@@ -117,6 +142,10 @@ jobs:
       MODEL_SIZE: ${{ github.event.inputs.model_size }}
       TRANSLATION_OUTPUT: ${{ github.event.inputs.translation_output }}
       GEMINI_MODEL: ${{ github.event.inputs.gemini_model }}
+      SAVE_VIDEO: ${{ github.event.inputs.save_video }}
+      CLEAN_AUDIO: ${{ github.event.inputs.clean_audio }}
+      SPEAKERS: ${{ github.event.inputs.speakers == 'true' && 'on' || 'off' }}
+      VIDEO_QUALITY: ${{ github.event.inputs.video_quality }}
 
     steps:
       # Normalize free-form inputs. Any file name is accepted: it is cleaned
@@ -253,7 +282,7 @@ jobs:
       # YouTube breaks older yt-dlp builds quickly, so always take the latest.
       # "[default]" brings the yt-dlp-ejs challenge solver; it needs a JS runtime (Deno).
       - name: Install yt-dlp and Deno (YouTube source)
-        if: ${{ env.SOURCE == 'youtube' && env.HAVE_TRANSCRIPT != 'true' }}
+        if: ${{ env.SOURCE == 'youtube' && (env.HAVE_TRANSCRIPT != 'true' || env.SAVE_VIDEO == 'true') }}
         run: |
           pip install -U "yt-dlp[default]"
           curl -fsSL https://deno.land/install.sh | sh
@@ -344,6 +373,42 @@ jobs:
             exit 1
           fi
 
+      # srt only. Isolates the voice (Demucs "vocals" stem) so music, songs and noise do
+      # not hide speech. Best effort: on any failure the original audio is used.
+      - name: Isolate voice from music and noise (Demucs)
+        if: ${{ env.HAVE_TRANSCRIPT != 'true' && env.FMT == 'srt' && env.CLEAN_AUDIO == 'true' }}
+        continue-on-error: true
+        run: |
+          pip install --quiet torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet demucs==4.0.1 soundfile "numpy<2"
+          rm -rf demucs_out
+          python -m demucs --two-stems=vocals -n htdemucs -d cpu -j 2 -o demucs_out "$AUDIO_FILE"
+          VOCALS="$(find demucs_out -name vocals.wav | head -n 1)"
+          test -n "$VOCALS"
+          # The cleaned track must last EXACTLY as long as the original so cue times match the audio.
+          ORIG=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$AUDIO_FILE")
+          ffmpeg -v error -y -i "$VOCALS" -ac 1 -ar 16000 -af "highpass=f=70,loudnorm=I=-18:TP=-1.5:LRA=11,apad" -t "$ORIG" cleaned_voice.wav
+          DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 cleaned_voice.wav)
+          awk -v d="$DUR" -v o="$ORIG" 'BEGIN { x = d - o; if (x < 0) x = -x; exit !(d + 0 > 0 && x < 0.1) }'
+          echo "AUDIO_FILE=cleaned_voice.wav" >> "$GITHUB_ENV"
+          echo "AUDIO_CLEANED=1" >> "$GITHUB_ENV"
+          echo "Voice isolated: cleaned_voice.wav ($DUR s)"
+
+      # srt only. Speaker detection models (sherpa-onnx, CPU, no account/token needed).
+      - name: Prepare speaker detection (sherpa-onnx)
+        if: ${{ env.HAVE_TRANSCRIPT != 'true' && env.FMT == 'srt' && env.SPEAKERS == 'on' }}
+        continue-on-error: true
+        run: |
+          pip install --quiet sherpa-onnx "numpy<2"
+          D="$RUNNER_TEMP/diarize"; mkdir -p "$D"
+          B=https://github.com/k2-fsa/sherpa-onnx/releases/download
+          curl -fL --retry 3 --retry-delay 5 -o "$D/seg.tar.bz2" "$B/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
+          tar -xjf "$D/seg.tar.bz2" -C "$D"
+          cp "$(find "$D" -name model.onnx | head -n 1)" "$D/segmentation.onnx"
+          curl -fL --retry 3 --retry-delay 5 -o "$D/embedding.onnx" "$B/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
+          ls -lh "$D/segmentation.onnx" "$D/embedding.onnx"
+          echo "SHERPA_DIARIZE_DIR=$D" >> "$GITHUB_ENV"
+
       - name: Transcribe with faster-whisper
         if: ${{ env.HAVE_TRANSCRIPT != 'true' }}
         run: |
@@ -430,6 +495,36 @@ jobs:
       # partial translation and the extraction screenshot (debug_extract.png,
       # only present on extraction failure) are never lost. The job still ends
       # red on failure.
+      # Optional: the YouTube video itself (.mp4), uploaded UNZIPPED as its own
+      # artifact so it can be opened/played directly after downloading it on a
+      # phone. It runs after everything else and never fails the job.
+      - name: Download video from YouTube
+        if: ${{ !cancelled() && env.SOURCE == 'youtube' && env.SAVE_VIDEO == 'true' && env.SAFE_NAME != '' }}
+        continue-on-error: true
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+          YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
+          YOUTUBE_MAX_MINUTES: '240'
+          YOUTUBE_VIDEO_MAX_MB: '1500'
+        run: |
+          python download_youtube_video.py "$CLEAN_URL" video_download "$RUNNER_TEMP/video_file.txt" "${VIDEO_QUALITY:-720}"
+          NAME="$(cat "$RUNNER_TEMP/video_file.txt")"
+          if [[ "$NAME" != "video_download.mp4" ]]; then
+            echo "::error::Unexpected video file name from the downloader."
+            exit 1
+          fi
+          mkdir -p video_out
+          mv "$NAME" "video_out/${SAFE_NAME}.mp4"
+          echo "VIDEO_READY=true" >> "$GITHUB_ENV"
+
+      - name: Upload video artifact
+        if: ${{ !cancelled() && env.VIDEO_READY == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: video_out/${{ env.SAFE_NAME }}.mp4
+          archive: false
+          retention-days: 14
+
       - name: Upload transcript artifact
         if: ${{ !cancelled() && env.SAFE_NAME != '' }}
         uses: actions/upload-artifact@v4
