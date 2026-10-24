@@ -108,7 +108,7 @@ Environment variables
                              lowered automatically while models answer 503
     TRANSLATE_PROOFREAD      on (default) | off
     TRANSLATE_PROOF_BATCH    paragraphs per proofreading request (default 25)
-    TRANSLATE_PROOF_LEVEL    thinking level of the proofreading pass (default medium)
+    TRANSLATE_PROOF_LEVEL    thinking level of the proofreading pass (default low)
     TRANSLATE_MAX_MINUTES    global time budget (default 60; stages get fixed shares of it)
     TRANSLATE_REVIEW_MODEL   default: the quality chain (pro-preview has no free-tier quota);
                              set a model name to try it first ; "off" disables review
@@ -151,9 +151,9 @@ CTX = {"txt": (2, 1), "srt": (6, 3)}   # (units before, units after) given as co
 
 DEFAULT_MODEL = "gemini-3.8-flash"
 # Only Flash models with free-tier quota on this project (AI Studio rate-limit page, 2026-10-23):
-# 3.8 / 3.6 / 3 / 2.5 Flash = 5 RPM, 250K TPM, 20 RPD each. gemini-3.7-flash and gemini-3.5-flash
+# 3.8 / 3.6 / 3 Flash = 5 RPM, 250K TPM, 20 RPD each. gemini-3.7-flash and gemini-3.5-flash
 # have no listed quota, so they are no longer in the chain.
-QUALITY_CHAIN = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3-flash-preview", "gemini-2.5-flash"]
+QUALITY_CHAIN = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3-flash-preview"]
 LAST_RESORT = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 DEFAULT_REVIEW_MODEL = ""          # empty = use the quality chain (free tier has no pro quota)
 
@@ -177,6 +177,10 @@ DEMOTE_AFTER = 2             # consecutive failures before a model is demoted
 DEMOTE_SECS = 60             # circuit breaker: base open time, doubles per extra failure (max 300s)
 STICKY_SECS = 300            # the model that just succeeded is tried FIRST for this long
 PROOF_BATCH = 40
+PROOF_PATIENCE = 45          # seconds per proofreading request (optional polish: never worth a long wait)
+PROOF_TIME_CAP = 180         # whole proofreading pass is abandoned after this many seconds
+REVIEW_PATIENCE = 90         # seconds per review request
+PROOF_DEADLINE = [0.0]
 GEMMA = ["gemma-4-31b-it", "gemma-4-26b-a4b-it"]
 GEMMA_WORDS = 900            # English words per Gemma request (16K tokens/min limit)
 GEMMA_MAX_UNITS = {"txt": 8, "srt": 30}
@@ -290,7 +294,7 @@ class Gate:
         with self.cv:
             now = time.time()
             self.ok = 0
-            if self.limit > 1 and now - self.last_cut >= 15:
+            if self.limit > 2 and now - self.last_cut >= 15:   # 503 = one model busy, not a rate limit: keep >= 2 workers
                 self.limit -= 1
                 self.last_cut = now
                 print(f"  concurrency lowered to {self.limit}")
@@ -1886,7 +1890,7 @@ def _review_worker(job, chain, part):
     for _ in range(2):                      # a failed batch is retried once
         try:
             text, model = call_gemini(chain, REVIEW_SYSTEM, prompt, CHUNK_SCHEMA,
-                                      level="high", patience=QUALITY_PATIENCE, rounds=1)
+                                      level="high", patience=REVIEW_PATIENCE, rounds=1)
             got, problems = parse_items(clean_json(text), [u for u, _r in part])
             return got, problems, model
         except ApiUnavailable as e:
@@ -1993,9 +1997,12 @@ def _proof_worker(job, chain, level, batch):
               f"PROOFREAD these {len(batch)} paragraphs:\nITEMS:\n{items}")
     last = None
     for _ in range(2):
+        left = PROOF_DEADLINE[0] - time.time()
+        if left <= 5:
+            raise RuntimeError("proofreading time cap reached")
         try:
             text, model = call_gemini(chain, PROOF_SYSTEM, prompt, PROOF_SCHEMA, level=level,
-                                      patience=QUALITY_PATIENCE, rounds=1)
+                                      patience=min(PROOF_PATIENCE, left), rounds=1)
             res = clean_json(text)
             if isinstance(res, dict):
                 res = res.get("corrections") or res.get("items") or []
@@ -2019,7 +2026,7 @@ def plan_proof(job, skip):
         size = max(5, int(os.environ.get("TRANSLATE_PROOF_BATCH", PROOF_BATCH)))
     except ValueError:
         size = PROOF_BATCH
-    lvl = os.environ.get("TRANSLATE_PROOF_LEVEL", "medium").strip().lower()
+    lvl = os.environ.get("TRANSLATE_PROOF_LEVEL", "low").strip().lower()
     level = None if lvl in ("", "off", "none") else lvl
     todo = [u for u in job.units if job.ar[u["id"] - 1] and not job.kept_en[u["id"] - 1]
             and u["id"] not in job.proofed and u["id"] not in skip]
@@ -2060,6 +2067,7 @@ def qa_pass(job):
     tasks = [("review", p) for p in parts] + [("proof", b) for b in batches]
     if not tasks:
         return
+    PROOF_DEADLINE[0] = time.time() + PROOF_TIME_CAP
     print(f"Quality pass: {len(parts)} review + {len(batches)} proofreading request(s) in parallel.")
     stopped = []
 
