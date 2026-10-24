@@ -65,6 +65,7 @@ MAX_CUE_CHARS = 80             # hard cap on cue length (one comfortable line pa
 SOFT_MIN_SECONDS = 1.0         # a sentence end closes the cue once it lasts this long
 SOFT_COMMA_SECONDS = 2.0       # a comma / ; : closes the cue once it lasts this long
 SOFT_COMMA_CHARS = 45          # ...or once it has this many characters
+MIN_SPEAKER_SECONDS = 10.0     # a "speaker" with less talk time than this (or < 5% of all speech) is a clustering artefact
 MAX_SPEAKER_TURNS_PER_CUE = 2  # more than 2 speaker turns inside one cue -> a new cue starts
 END_HOLD_SECONDS = 0.12        # small hold after the last word (clipped to next cue)
 MIN_CUE_SECONDS = 0.30         # shortest displayed cue (clipped to next cue)
@@ -175,7 +176,8 @@ def run_diarization(path: str):
                 num_threads=threads,
             ),
             embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=emb_model, num_threads=threads),
-            clustering=sherpa_onnx.FastClusteringConfig(num_clusters=-1, threshold=0.5),
+            clustering=sherpa_onnx.FastClusteringConfig(
+                num_clusters=-1, threshold=float(os.environ.get("SPEAKER_THRESHOLD", "0.8"))),
             min_duration_on=0.3,
             min_duration_off=0.4,
         )
@@ -191,9 +193,14 @@ def run_diarization(path: str):
         print(f"Speakers: running diarization on {len(samples) / rate:.0f}s of audio...")
         result = sd.process(samples).sort_by_start_time()
         segs = [(float(r.start), float(r.end), int(r.speaker)) for r in result]
-        n = len({x[2] for x in segs})
-        print(f"Speakers: {len(segs)} segments, {n} speaker(s) found.")
-        return segs if n >= 2 else None  # one speaker -> no dashes needed
+        total = {}
+        for s0, e0, k in segs:
+            total[k] = total.get(k, 0.0) + (e0 - s0)
+        speech = sum(total.values()) or 1.0
+        keep = {k for k, v in total.items() if v >= MIN_SPEAKER_SECONDS and v >= 0.05 * speech}
+        print(f"Speakers: {len(segs)} segments, {len(total)} raw cluster(s) -> {len(keep)} real speaker(s).")
+        segs = [x for x in segs if x[2] in keep]
+        return segs if len(keep) >= 2 else None  # one speaker -> no dashes needed
     except Exception as e:  # never block the transcription
         print(f"WARNING: speaker diarization failed ({type(e).__name__}: {e}); continuing without it.")
         return None
@@ -533,6 +540,8 @@ def main():
         def emit(start, end, text):
             nonlocal count, prev_end
             if output_format == "srt":
+                if chunks and sum(max(0.0, min(e, end) - max(s, start)) for s, e in chunks) < 0.15:
+                    return                       # no real speech under this cue (music/noise hallucination)
                 s2, e2 = snap_cue(start, end, chunks)
                 if s2 >= prev_end:               # never overlap the previous cue
                     start = s2
