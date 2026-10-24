@@ -101,12 +101,18 @@ on:
         required: false
         default: false
         type: boolean
-      video_quality:
-        description: 'Max video height when save_video is ticked (lower = smaller file)'
+      video_only:
+        description: 'YouTube links only: download the VIDEO only (mp4) - no transcription, no translation (save_video is implied)'
         required: false
-        default: '720'
+        default: false
+        type: boolean
+      video_quality:
+        description: 'Max video height when saving the video (lower = smaller file)'
+        required: false
+        default: '240'
         type: choice
         options:
+          - '240'
           - '360'
           - '480'
           - '720'
@@ -141,7 +147,8 @@ jobs:
       MODEL_SIZE: ${{ github.event.inputs.model_size }}
       TRANSLATION_OUTPUT: ${{ github.event.inputs.translation_output }}
       GEMINI_MODEL: ${{ github.event.inputs.gemini_model }}
-      SAVE_VIDEO: ${{ github.event.inputs.save_video }}
+      SAVE_VIDEO: ${{ github.event.inputs.save_video == 'true' || github.event.inputs.video_only == 'true' }}
+      VIDEO_ONLY: ${{ github.event.inputs.video_only == 'true' }}
       CLEAN_AUDIO: ${{ github.event.inputs.clean_audio }}
       SPEAKERS: ${{ github.event.inputs.speakers == 'true' && 'on' || 'off' }}
       VIDEO_QUALITY: ${{ github.event.inputs.video_quality }}
@@ -191,15 +198,25 @@ jobs:
             echo "::error::share_url must be an https NotebookLM (Google) link or a youtube.com / youtu.be video link."
             exit 1
           fi
-          if [[ "$TRANSLATE" == "true" && "$HAS_GEMINI_KEY" != "true" ]]; then
+          if [[ "$VIDEO_ONLY" == "true" && "$SOURCE" != "youtube" ]]; then
+            echo "::error::Video-only mode needs a youtube.com / youtu.be link."
+            exit 1
+          fi
+          if [[ "$TRANSLATE" == "true" && "$VIDEO_ONLY" != "true" && "$HAS_GEMINI_KEY" != "true" ]]; then
             echo "::error::Translation is enabled but the GEMINI_API_KEY repository secret is not set."
             exit 1
           fi
           echo "Audio source: $SOURCE"
           echo "SOURCE=$SOURCE" >> "$GITHUB_ENV"
           KEY="$(printf '%s' "$CLEAN_URL" | sha1sum | cut -c1-16)"
-          echo "TCACHE=transcribe-link-$KEY" >> "$GITHUB_ENV"
           echo "FMT=$OUTPUT_FORMAT" >> "$GITHUB_ENV"
+          if [[ "$VIDEO_ONLY" == "true" ]]; then
+            # Video only: no audio download, transcription, translation or resume cache.
+            echo "HAVE_TRANSCRIPT=true" >> "$GITHUB_ENV"
+            echo "::notice::Video-only mode: transcription and translation are skipped."
+          else
+            echo "TCACHE=transcribe-link-$KEY" >> "$GITHUB_ENV"
+          fi
 
       - name: Validate translation time budget
         env:
@@ -216,7 +233,7 @@ jobs:
 
       - name: Restore previous transcript and translation checkpoint
         id: prev
-        if: ${{ github.event.inputs.reuse_previous == 'true' }}
+        if: ${{ github.event.inputs.reuse_previous == 'true' && env.VIDEO_ONLY != 'true' }}
         uses: actions/cache/restore@v4
         with:
           path: resume_cache
@@ -262,7 +279,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install ffmpeg and aria2
-        if: ${{ env.HAVE_TRANSCRIPT != 'true' }}
+        if: ${{ env.HAVE_TRANSCRIPT != 'true' || env.VIDEO_ONLY == 'true' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2
@@ -423,7 +440,7 @@ jobs:
           python transcribe.py "$AUDIO_FILE" "$SAFE_NAME.$FMT" "$FMT" "$MODEL_SIZE"
 
       - name: Translate to Arabic with Gemini
-        if: ${{ github.event.inputs.translate == 'true' }}
+        if: ${{ github.event.inputs.translate == 'true' && env.VIDEO_ONLY != 'true' }}
         # GitHub expressions have no arithmetic, so the step cap is fixed at the maximum budget
         # (200) + 20 min margin. The real limit is enforced by the script itself
         # (TRANSLATE_MAX_MINUTES), which saves partial output + checkpoint when it is reached.
@@ -489,7 +506,7 @@ jobs:
           key: ${{ env.TCACHE }}-${{ github.run_id }}
 
       - name: Flag incomplete translation
-        if: ${{ always() && env.SAFE_NAME != '' && github.event.inputs.translate == 'true' }}
+        if: ${{ always() && env.SAFE_NAME != '' && github.event.inputs.translate == 'true' && env.VIDEO_ONLY != 'true' }}
         run: |
           REPORT="${SAFE_NAME}_report.txt"
           [[ -f "$REPORT" ]] || exit 0
@@ -515,7 +532,7 @@ jobs:
           YOUTUBE_MAX_MINUTES: '240'
           YOUTUBE_VIDEO_MAX_MB: '1500'
         run: |
-          python download_youtube_video.py "$CLEAN_URL" video_download "$RUNNER_TEMP/video_file.txt" "${VIDEO_QUALITY:-720}"
+          python download_youtube_video.py "$CLEAN_URL" video_download "$RUNNER_TEMP/video_file.txt" "${VIDEO_QUALITY:-240}"
           NAME="$(cat "$RUNNER_TEMP/video_file.txt")"
           if [[ "$NAME" != "video_download.mp4" ]]; then
             echo "::error::Unexpected video file name from the downloader."
@@ -534,7 +551,7 @@ jobs:
           retention-days: 14
 
       - name: Upload transcript artifact
-        if: ${{ !cancelled() && env.SAFE_NAME != '' }}
+        if: ${{ !cancelled() && env.SAFE_NAME != '' && env.VIDEO_ONLY != 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.SAFE_NAME }}
