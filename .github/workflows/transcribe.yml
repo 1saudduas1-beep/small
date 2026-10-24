@@ -278,11 +278,31 @@ jobs:
         with:
           python-version: '3.11'
 
+      # apt can hang on a slow mirror, so: skip when the tools already exist, install only
+      # what is missing without recommended packages (far fewer downloads), cap every
+      # attempt with a hard timeout and retry; the step itself is also time-limited.
       - name: Install ffmpeg and aria2
         if: ${{ env.HAVE_TRANSCRIPT != 'true' || env.VIDEO_ONLY == 'true' }}
+        timeout-minutes: 12
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg aria2
+          PKGS=""
+          command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null || PKGS="$PKGS ffmpeg"
+          command -v aria2c >/dev/null || PKGS="$PKGS aria2"
+          if [[ -z "$PKGS" ]]; then echo "ffmpeg and aria2 are already installed."; exit 0; fi
+          echo "Installing:$PKGS"
+          export DEBIAN_FRONTEND=noninteractive
+          APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Dpkg::Lock::Timeout=60"
+          for i in 1 2 3; do
+            if timeout -k 10 60 sudo apt-get $APT update -qq \
+               && timeout -k 10 150 sudo apt-get $APT install -y -qq --no-install-recommends $PKGS; then
+              exit 0
+            fi
+            echo "::warning::apt attempt $i failed or hung; retrying..."
+            sudo dpkg --configure -a || true
+            sleep 5
+          done
+          echo "::error::Could not install$PKGS after 3 attempts."
+          exit 1
 
       - name: Install faster-whisper
         if: ${{ env.HAVE_TRANSCRIPT != 'true' }}
