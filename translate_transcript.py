@@ -542,7 +542,10 @@ def parse_transcript(path):
         if rest and TIMESTAMP_RE.match(rest[0].strip()):
             ts = rest[0].strip()
             rest = rest[1:]
-        text = " ".join(l.strip() for l in rest).strip()
+        if sum(1 for l in rest if l.lstrip().startswith("-")) >= 2:
+            text = "\n".join(l.strip() for l in rest).strip()   # speaker turns, one per line
+        else:
+            text = " ".join(l.strip() for l in rest).strip()
         segments.append({"idx": idx, "time": ts, "text": text})
     return segments
 
@@ -1297,6 +1300,20 @@ def term_adherence(job):
     return [head] + out
 
 
+TURN_SPLIT_RE = re.compile(r"(?:^|\n|\s)[-\u2013\u2014]\s*(?=\S)")
+
+
+def fix_turns(en, ar):
+    """Cues with several speaker turns ('-a' / '-b' lines) keep one '-' line per turn."""
+    n = sum(1 for l in en.split("\n") if l.lstrip().startswith("-"))
+    if n < 2 or not ar:
+        return ar
+    parts = [p.strip() for p in TURN_SPLIT_RE.split(ar) if p.strip()]
+    if len(parts) >= 2:
+        return "\n".join("-" + p for p in parts)
+    return ar
+
+
 def render_text(text, seen, en_paren=True):
     """⟦ar|en⟧ -> 'ar (en)' on the first appearance of `en`, else 'ar' (always 'ar' when en_paren is False)."""
     def repl(m):
@@ -1495,6 +1512,7 @@ SYSTEM_TXT = SYSTEM_COMMON + """
 
 SYSTEM_SRT = SYSTEM_COMMON + """
 8. Each item is ONE subtitle cue, often a fragment that starts or ends mid-sentence. Keep a strict 1:1 alignment: translate the fragment as the matching fragment of the Arabic sentence, keep each cue short, and move no content between cues beyond what Arabic word order forces. A short interjection ("Yeah.", "Right.") gets a short natural Arabic equivalent.
+10. SPEAKER TURNS: if an item has several lines that each start with "-", it holds different speakers. Return the SAME number of turns, in the same order, each on its own line starting with "-" (write the "-" directly before the Arabic text).
 9. ARABIC ONLY (video subtitles): write every word in Arabic letters, with no Latin letters at all and nothing kept in English. Acronyms, person names, brand names and drug names are written in Arabic transliteration as the arabic part of the markup, e.g. ⟦في دبليو إف|VWF⟧. The English part of the markup is for the program only and is never shown."""
 
 CHUNK_SCHEMA = {
@@ -2099,7 +2117,8 @@ def autotag_terms(job, rendered, seen):
 def render_all(job):
     seen, out = set(), []
     for i, u in enumerate(job.units):
-        out.append(render_text(job.ar[i], seen, job.kind != "srt") if job.ar[i] is not None else u["en"])
+        rendered = render_text(job.ar[i], seen, job.kind != "srt") if job.ar[i] is not None else u["en"]
+        out.append(fix_turns(u["en"], rendered) if job.kind == "srt" else rendered)
     if job.kind == "srt":        # video subtitles: Arabic only, no English in parentheses
         job.autotag_log = []
     else:
