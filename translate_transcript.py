@@ -17,8 +17,10 @@ How it works
      as one line per audio fragment. .srt input stays 1:1 per cue (timing kept).
      Requests are id-matched; only missing/invalid ids are re-requested.
   3. TERMS: the model marks technical terms as  ⟦arabic|English⟧. The program
-     (not the model) writes the English in parentheses on the FIRST appearance
-     only, so it is never repeated and never forgotten.
+     (not the model) writes every medical / scientific name and term in ENGLISH
+     at every appearance, followed by its Arabic translation in parentheses:
+     "Entamoeba histolytica (الأميبا الحالّة للنسج)". TERM_GLOSS=first (default) puts the
+     parenthesised Arabic only on the first appearance of a term; TERM_GLOSS=always repeats it.
   4. CHECKS (no API calls): number mismatch, possible omission/addition,
      leftover English, unmarked glossary terms, repeated phrases.
   4b. FREE-TIER AWARE: a lite-model answer is never accepted while a quality model
@@ -46,6 +48,8 @@ v9 - SPEED + QUALITY (free tier, target <= 30 min)
     * Context pass on a bounded sample (medium thinking); adaptive batch size so all
       TRANSLATE_PARALLEL workers are busy; ONE merged quality pass (MQM-style review of the
       suspect units + proofreading of the rest, in parallel).
+    * English-first terms: medical/scientific terms are shown as  English (العربية)  in every output
+      (txt and srt); see TERM_GLOSS below.
     * Glossary terms are ENFORCED by the program (marked term replaced by the glossary
       Arabic when it deviates) and a per-term adherence table is written to the report.
     * A complete file is always produced: Gemma / lite drafts are upgraded by Flash in the
@@ -106,6 +110,8 @@ Environment variables
     TRANSLATE_GEMMA_WORDS    English words per Gemma request (default 900)
     TRANSLATE_PARALLEL       max parallel requests (default: min(3, number of keys));
                              lowered automatically while models answer 503
+    TERM_GLOSS               first (default) | always  - Arabic translation in parentheses after the
+                             English term: only at its first appearance, or at every appearance
     TRANSLATE_PROOFREAD      on (default) | off
     TRANSLATE_PROOF_BATCH    paragraphs per proofreading request (default 25)
     TRANSLATE_PROOF_LEVEL    thinking level of the proofreading pass (default low)
@@ -1279,6 +1285,98 @@ def post_process(job, ar, counter=None):
     return swap_known_english(job, enforce_glossary(job, fix_marks(ar), counter))
 
 
+_SUFFIX_RE = re.compile(r"(ies|es|s|ed|ing|ly|al|ic|ical|ous)$")
+
+
+def _inflection_of(a, b):
+    """True when a and b differ only by a common suffix (plural, -ic, -al ...): not a mishearing."""
+    sa, sb = _SUFFIX_RE.sub("", a), _SUFFIX_RE.sub("", b)
+    return sa == sb or sa.startswith(sb) or sb.startswith(sa)
+
+
+def auto_asr(job):
+    """Deterministic speech-recognition repair list (no API call): words of the transcript that are a
+    near-miss spelling of a glossary / known term ('Pansytopenia' -> 'Pancytopenia', 'Nemotodes' ->
+    'Nematodes') are added to the mishearing list that every translation and review prompt receives."""
+    with job.lock:
+        known = {}
+        for k, (en, _ar) in job.gloss.items():
+            for w in re.findall(r"[A-Za-z][A-Za-z'-]{5,}", en):
+                known.setdefault(w.lower(), w)
+        for c in job.brief.get("asr_corrections", []):
+            for w in re.findall(r"[A-Za-z][A-Za-z'-]{5,}", str(c.get("meant", ""))):
+                known.setdefault(w.lower(), w)
+        have = {str(c.get("heard", "")).lower() for c in job.brief.get("asr_corrections", [])}
+    if not known:
+        return 0
+    freq = Counter(w.lower() for u in job.units for w in re.findall(r"[A-Za-z][A-Za-z'-]{5,}", u["en"]))
+    by_first = {}
+    for k in known:
+        by_first.setdefault(k[0], []).append(k)
+    added = 0
+    for w, n in freq.items():
+        if w in known or w in have:
+            continue
+        best, score = None, 0.0
+        for k in by_first.get(w[0], []):
+            if abs(len(k) - len(w)) > 2 or _inflection_of(w, k):
+                continue
+            r = difflib.SequenceMatcher(None, w, k).ratio()
+            if r > score:
+                best, score = k, r
+        if best and score >= 0.86 and freq.get(best, 0) + 1 >= 1:
+            row = {"heard": w, "meant": known[best], "auto": True}
+            job.brief.setdefault("asr_corrections", []).append(row)
+            job.asr_auto.append(f"{w} -> {known[best]} (x{n}, similarity {score:.2f})")
+            added += 1
+    return added
+
+
+def unify_terms(job):
+    """One Arabic rendering per English term for the whole document: when the same marked English term
+    got different Arabic renderings, every minority form is replaced by the glossary Arabic, else by
+    the most frequent form (inflections that keep the stem are left alone)."""
+    forms = {}
+    for i, raw in enumerate(job.ar):
+        if not raw:
+            continue
+        for ar, en in MARK_RE.findall(raw):
+            ar, en = ar.strip(), en.strip()
+            if en and LATIN_RE.search(en) and ARABIC_RE.search(ar) and not LATIN_RE.search(ar):
+                forms.setdefault(en.lower(), Counter())[ar] += 1
+    canon = {}
+    for k, cnt in forms.items():
+        if len(cnt) < 2:
+            continue
+        std = job.gloss.get(k, ("", ""))[1].strip()
+        if std and ARABIC_RE.search(std) and any(_same_term(a, std) for a in cnt):
+            best = std
+        else:
+            best = cnt.most_common(1)[0][0]
+        if any(not _same_term(a, best) for a in cnt):
+            canon[k] = best
+    if not canon:
+        return 0
+    changed = [0]
+
+    def repl(m):
+        ar, en = m.group(1).strip(), m.group(2).strip()
+        best = canon.get(en.lower())
+        if not best or not ARABIC_RE.search(ar) or LATIN_RE.search(ar) or _same_term(ar, best):
+            return m.group(0)
+        new = best
+        if ar.startswith("ال") and not best.startswith("ال") and len(best.split()) == 1:
+            new = "ال" + best
+        job.unify_log.append(f"{en}: {ar} -> {new}")
+        changed[0] += 1
+        return f"⟦{new}|{en}⟧"
+
+    for i, raw in enumerate(job.ar):
+        if raw:
+            job.ar[i] = MARK_RE.sub(repl, raw)
+    return changed[0]
+
+
 def term_adherence(job):
     rows = []
     for k in sorted(job.core):
@@ -1318,19 +1416,36 @@ def fix_turns(en, ar):
     return ar
 
 
+TERM_GLOSS = os.environ.get("TERM_GLOSS", "first").strip().lower()
+if TERM_GLOSS not in ("first", "always"):
+    TERM_GLOSS = "first"
+ARABIC_LETTER_RE = re.compile(r"[\u0621-\u064A]")
+MODEL_PAREN_RE = re.compile(r"(⟦[^⟦⟧]*⟧)\s*\(\s*[A-Za-z][^()\u0600-\u06FF]*\)")
+
+
 def render_text(text, seen, en_paren=True):
-    """⟦ar|en⟧ -> 'ar (en)' on the first appearance of `en`, else 'ar' (always 'ar' when en_paren is False)."""
+    """⟦ar|en⟧ -> 'en (ar)': the term is ALWAYS written in English; its Arabic translation goes in
+    parentheses on the first appearance (TERM_GLOSS=first) or at every appearance (TERM_GLOSS=always).
+    en_paren=False -> Arabic only (legacy)."""
+    text = MODEL_PAREN_RE.sub(r"\1", text)      # the model wrote the English itself: drop its copy
+
     def repl(m):
-        ar, en = m.group(1).strip(), m.group(2).strip()
-        if not ar:
-            return en
-        key = en.lower()
-        if not en_paren or not LATIN_RE.search(en) or key in seen:
+        ar, en = m.group(1).strip().strip("ـ"), m.group(2).strip()
+        if not en:
             return ar
+        if not en_paren or not LATIN_RE.search(en):
+            return ar or en
+        has_ar = bool(ARABIC_RE.search(ar)) and not LATIN_RE.search(ar)
+        key = en.lower()
+        first = key not in seen
         seen.add(key)
-        if re.match(r"\s*\(\s*[A-Za-z]", m.string[m.end():m.end() + 40]):
-            return ar  # the model already wrote the English itself
-        return f"{ar} ({en})"
+        term = en
+        if has_ar and (first or TERM_GLOSS == "always") and ar.lower() != en.lower():
+            term = f"{en} ({ar})"
+        before = m.string[m.start() - 1] if m.start() > 0 else ""
+        if before and ARABIC_LETTER_RE.match(before):
+            term = " " + term                  # attached Arabic prefix (و ب ل ف): keep it readable
+        return term
 
     out = strip_markup(MARK_RE.sub(repl, text))
     out = re.sub(r"[ \t]+", " ", out).strip()
@@ -1365,6 +1480,8 @@ class Job:
         self.core = set()             # keys that came from the context pass
         self.review_log = []
         self.term_log = []
+        self.unify_log = []
+        self.asr_auto = []
 
     def fingerprint(self):
         h = hashlib.sha256()
@@ -1448,7 +1565,9 @@ def build_brief(job):
         "signs and symptoms, anatomy, physiology, lab tests, drugs, eponyms, acronyms, person names and "
         "recurring expressions/analogies. Use the established Arabic term from the Unified Medical "
         "Dictionary / Arabic medical textbooks when one exists, otherwise a short descriptive Arabic phrase "
-        "- never an invented transliteration. 'en' must be the CORRECT English spelling.\n"
+        "- never an invented transliteration (drug, organism and person names may use a clear Arabic transliteration). "
+        "'en' must be the CORRECT English spelling of the term" + (" as it will be shown in the final text; 'ar' is its "
+        "Arabic translation, written in parentheses after it." if ENGLISH_TERMS else "; 'ar' is its Arabic rendering.") + "\n"
         "- asr_corrections: words that speech recognition clearly misheard, ONLY when the intended word is "
         "evident from the surrounding context (e.g. heard 'coxone' -> meant 'COX-1'). Leave empty if none.\n"
         "- keep_english: words or names that must stay in English inside the Arabic text, e.g. the words of "
@@ -1506,10 +1625,21 @@ Rules:
 1. Write clear, natural Modern Standard Arabic (فصحى مبسطة) for students, as if originally written in Arabic: complete, well-formed sentences with correct grammar and agreement. Keep the speakers' meaning, tone and emphasis. Drop empty fillers (you know, like, right?, yeah) unless they carry meaning.
 2. Translate by MEANING and CONTEXT. Use the glossary, summary and neighbouring items to resolve pronouns, ambiguity and idioms. Never translate an idiom or analogy literally; render its intended meaning.
 3. The English comes from AUTOMATIC SPEECH RECOGNITION and may contain mishearings of medical terms and names. Use the domain, the known mishearings and the context to infer the intended word and translate THAT. Never translate a nonsense word literally and never invent a term. If two readings are possible, choose the one that fits the medical context.
-4. Terminology: use the standard Arabic term used in Arabic medical education (Unified Medical Dictionary / textbooks). Follow the glossary exactly and keep ONE Arabic term per concept for the whole document. If no standard term exists, use a short descriptive Arabic phrase instead of a transliteration.
-5. TERM MARKUP: every time you use a glossary term, or any other technical term (disease, sign, anatomical structure, cell, drug, test, eponym, person name, acronym), write it as ⟦arabic|English⟧. `arabic` is the exact inflected form needed in the sentence (put attached prefixes such as و ب ل ف outside the brackets); `English` is the canonical English term, using the glossary's English or the corrected spelling when it was misheard. For an acronym write the acronym as the arabic part, e.g. ⟦VWF|von Willebrand factor⟧. Do NOT write English in parentheses yourself - the program adds it on first appearance only. Do not mark ordinary words.
+4. Terminology: every medical or scientific name or term is shown in the final text in ENGLISH followed by its Arabic translation in parentheses, so the Arabic translation must be the standard Arabic term used in Arabic medical education (Unified Medical Dictionary / textbooks). Follow the glossary exactly and keep ONE Arabic translation per concept for the whole document. If no standard term exists, use a short descriptive Arabic phrase; for drug, organism and person names a clear Arabic transliteration is acceptable.
+5. TERM MARKUP: every time you use a glossary term, or any other medical or scientific term or name (disease, organism, sign, symptom, anatomical structure, cell, tissue, drug, test, procedure, eponym, person name, acronym), write it as ⟦arabic|English⟧. `English` is the term exactly as it must appear in the final text: the canonical English name (lowercase for common nouns; capitalised for proper names, eponyms and organism genera), using the glossary's English or the corrected spelling when it was misheard; for an acronym use the acronym, e.g. ⟦عامل فون ويلبراند|VWF⟧. `arabic` is ALWAYS the Arabic translation of that term (never Latin letters), in the standard/glossary form; put attached prefixes such as و ب ل ف outside the brackets. The program writes the English term followed by the Arabic in parentheses - do NOT write the English or any parentheses around terms yourself. Never leave a medical or scientific term as an unmarked Arabic word. Do not mark ordinary words.
 6. Numbers, units, doses, ages and lab values must be exact; write them with digits (0-9). Keep nothing in English except inside the markup and the words listed under KEEP IN ENGLISH (leave those exactly as given, in Latin letters).
 7. Never omit, merge, split, summarise or add content. Output EXACTLY one object {"i": same id, "ar": Arabic} per input item, every id once. Return only a JSON array."""
+
+ENGLISH_TERMS = os.environ.get("TERM_ENGLISH", "on").strip().lower() != "off"
+# TERM_ENGLISH=off (set by the workflow for YouTube links): Arabic only, no English terms in the output.
+_N45, _O45 = "4. Terminology: every medical or scientific name or term is shown in the final text in ENGLISH followed by its Arabic translation in parentheses, so the Arabic translation must be the standard Arabic term used in Arabic medical education (Unified Medical Dictionary / textbooks). Follow the glossary exactly and keep ONE Arabic translation per concept for the whole document. If no standard term exists, use a short descriptive Arabic phrase; for drug, organism and person names a clear Arabic transliteration is acceptable.\n5. TERM MARKUP: every time you use a glossary term, or any other medical or scientific term or name (disease, organism, sign, symptom, anatomical structure, cell, tissue, drug, test, procedure, eponym, person name, acronym), write it as ⟦arabic|English⟧. `English` is the term exactly as it must appear in the final text: the canonical English name (lowercase for common nouns; capitalised for proper names, eponyms and organism genera), using the glossary's English or the corrected spelling when it was misheard; for an acronym use the acronym, e.g. ⟦عامل فون ويلبراند|VWF⟧. `arabic` is ALWAYS the Arabic translation of that term (never Latin letters), in the standard/glossary form; put attached prefixes such as و ب ل ف outside the brackets. The program writes the English term followed by the Arabic in parentheses - do NOT write the English or any parentheses around terms yourself. Never leave a medical or scientific term as an unmarked Arabic word. Do not mark ordinary words.\n", "4. Terminology: use the standard Arabic term used in Arabic medical education (Unified Medical Dictionary / textbooks). Follow the glossary exactly and keep ONE Arabic term per concept for the whole document. If no standard term exists, use a short descriptive Arabic phrase instead of a transliteration.\n5. TERM MARKUP: every time you use a glossary term, or any other technical term (disease, sign, anatomical structure, cell, drug, test, eponym, person name, acronym), write it as ⟦arabic|English⟧. `arabic` is the exact inflected form needed in the sentence (put attached prefixes such as و ب ل ف outside the brackets); `English` is the canonical English term, using the glossary's English or the corrected spelling when it was misheard. For an acronym write the acronym as the arabic part, e.g. ⟦VWF|von Willebrand factor⟧. Do NOT write English in parentheses yourself - the program adds it on first appearance only. Do not mark ordinary words.\n"
+_N9, _O9 = '9. SUBTITLES: apart from the marked medical/scientific terms and the KEEP IN ENGLISH words, write every word in Arabic letters. Keep each cue short; the program shows each term in English and adds its Arabic translation in parentheses, so mark terms carefully and never add English yourself.', '9. ARABIC ONLY (video subtitles): write every word in Arabic letters, with no Latin letters at all and nothing kept in English. Acronyms, person names, brand names and drug names are written in Arabic transliteration as the arabic part of the markup, e.g. ⟦في دبليو إف|VWF⟧. The English part of the markup is for the program only and is never shown.'
+_NRV, _ORV = 'Keep the markup rules: every medical or scientific term stays wrapped as ⟦arabic|English⟧ where `English` is the canonical English term shown in the final text and `arabic` is its Arabic translation (never Latin letters); wrap any medical/scientific term that was left unmarked or written only in Arabic. Do not write English or parentheses around terms yourself.', 'Keep the markup rules: every technical term stays wrapped as ⟦arabic|English⟧ and no English is written in parentheses by you.'
+if not ENGLISH_TERMS:
+    SYSTEM_COMMON = SYSTEM_COMMON.replace(_N45, _O45)
+    _SRT_RULE9 = _O9
+else:
+    _SRT_RULE9 = _N9
 
 SYSTEM_TXT = SYSTEM_COMMON + """
 8. Each item is a whole PARAGRAPH of the lecture: translate it into ONE flowing Arabic paragraph (several sentences are fine). Join short interjections of the second speaker naturally into the flow."""
@@ -1517,7 +1647,8 @@ SYSTEM_TXT = SYSTEM_COMMON + """
 SYSTEM_SRT = SYSTEM_COMMON + """
 8. Each item is ONE subtitle cue, often a fragment that starts or ends mid-sentence. Keep a strict 1:1 alignment: translate the fragment as the matching fragment of the Arabic sentence, keep each cue short, and move no content between cues beyond what Arabic word order forces. A short interjection ("Yeah.", "Right.") gets a short natural Arabic equivalent.
 10. SPEAKER TURNS: if an item has several lines that each start with "-", it holds different speakers. Return the SAME number of turns, in the same order, each on its own line starting with "-" (write the "-" directly before the Arabic text).
-9. ARABIC ONLY (video subtitles): write every word in Arabic letters, with no Latin letters at all and nothing kept in English. Acronyms, person names, brand names and drug names are written in Arabic transliteration as the arabic part of the markup, e.g. ⟦في دبليو إف|VWF⟧. The English part of the markup is for the program only and is never shown."""
+""" + _SRT_RULE9
+
 
 CHUNK_SCHEMA = {
     "type": "ARRAY",
@@ -1852,6 +1983,11 @@ def check_unit(job, u):
             if not w.isupper() and w.lower() not in kw]
     if len(left) >= 2:
         reasons.append("untranslated English: " + ", ".join(left[:4]))
+    if re.search(r"[\u0400-\u04FF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF\u0590-\u05FF]", plain):
+        reasons.append("foreign-script characters in the Arabic (model glitch)")
+    sents = [x.strip().lower() for x in re.split(r"(?<=[.?!])\s+", en) if len(x.strip()) > 8]
+    if sents and max(Counter(sents).values()) >= 3:
+        reasons.append("the English source repeats the same sentence 3+ times (possible speech-recognition loop)")
     en_nums = set(re.findall(r"\d+(?:[.,]\d+)?", en))
     ar_nums = set(re.findall(r"\d+(?:[.,]\d+)?", to_western(plain)))
     miss = {n for n in en_nums - ar_nums
@@ -1871,9 +2007,13 @@ REVIEW_SYSTEM = """You are a senior English-to-Arabic medical translator reviewi
 For every item you get: the English source (automatic transcript - it may contain mishearings), the current Arabic draft (with ⟦arabic|English⟧ term markup) and the issues that were detected.
 Work like an MQM evaluator: for each item silently classify problems as ACCURACY (mistranslation, omission, addition, mishearing, wrong number), TERMINOLOGY (not the glossary term, inconsistent), FLUENCY (grammar, agreement, calques, awkward or unnatural phrasing) or STYLE, then output the corrected text only.
 Fix: mistranslations, omissions, additions, speech-recognition mishearings, non-standard or inconsistent terminology (follow the glossary exactly), ungrammatical or awkward Arabic (verb forms, gender/number agreement, odd phrases), leftover English, wrong numbers. Words under KEEP IN ENGLISH must stay in English.
-Keep the markup rules: every technical term stays wrapped as ⟦arabic|English⟧ and no English is written in parentheses by you.
+Keep the markup rules: every medical or scientific term stays wrapped as ⟦arabic|English⟧ where `English` is the canonical English term shown in the final text and `arabic` is its Arabic translation (never Latin letters); wrap any medical/scientific term that was left unmarked or written only in Arabic. Do not write English or parentheses around terms yourself.
 If a draft is already correct, return it unchanged. Never summarise, never add content.
 Return ONLY a JSON array with one {"i": same id, "ar": final Arabic} per item."""
+
+
+if not ENGLISH_TERMS:
+    REVIEW_SYSTEM = REVIEW_SYSTEM.replace(_NRV, _ORV)
 
 
 def _review_worker(job, chain, part):
@@ -1966,7 +2106,7 @@ def review_done(job, part, ok, val, stopped):
 # ---------------------------------------------------------------- proofreading
 PROOF_SYSTEM = """You are a meticulous Arabic copy-editor (Modern Standard Arabic) proofreading the Arabic translation of a medical lecture.
 Each item is one paragraph with ⟦arabic|English⟧ term markup. Find ONLY real language errors: wrong verb forms, gender/number/definiteness agreement, wrong prepositions, ungrammatical or meaningless phrases, unnatural calques from English (e.g. odd collocations), typos.
-Do NOT change meaning, terminology, numbers, English text or the ⟦ | ⟧ markup, and do not restyle sentences that are already correct.
+Do NOT change meaning, terminology, numbers, English terms or the ⟦ | ⟧ markup, and do not restyle sentences that are already correct.
 Return a JSON array of corrections {"i": paragraph id, "old": exact short substring copied from that paragraph (a word or phrase, at most 8 words, appearing exactly once in it), "new": the corrected replacement}. If a paragraph is fine, return nothing for it. If nothing needs fixing, return []."""
 
 PROOF_SCHEMA = {
@@ -2098,39 +2238,46 @@ def qa_pass(job):
 
 # ---------------------------------------------------------------- output
 def autotag_terms(job, rendered, seen):
-    """Glossary terms never marked by the model: add the English at their first appearance."""
+    """Glossary terms never marked by the model: the Arabic term becomes 'English (Arabic)' at its
+    first appearance."""
     job.autotag_log = []
     entries = [(en, ar.strip()) for k, (en, ar) in list(job.gloss.items())
                if k not in seen and LATIN_RE.search(en) and ARABIC_RE.search(ar)
                and len(ar.strip()) >= 4 and ar.strip().lower() != en.lower()]
     for en, ar in entries:
         en_re = re.compile(r"(?<![A-Za-z])" + re.escape(en) + r"(?![A-Za-z])", re.I)
-        ar_re = re.compile(r"(?<![\u0600-\u06FF])[وفبلك]?" + re.escape(ar) + r"(?![\u0600-\u06FF])")
+        ar_re = re.compile(r"(?<![\u0600-\u06FF])([وفبلك]?)(" + re.escape(ar) + r")(?![\u0600-\u06FF])")
         for i, u in enumerate(job.units):
             if job.kept_en[i] or job.ar[i] is None or not en_re.search(u["en"]):
                 continue
             hit = None
             for m in ar_re.finditer(rendered[i]):
-                if re.match(r"\s*\(\s*[A-Za-z]", rendered[i][m.end():m.end() + 40]):
-                    continue
+                tail = rendered[i][m.end():m.end() + 40]
+                head = rendered[i][max(0, m.start() - 60):m.start()]
+                if re.match(r"\s*\)", tail) or re.search(r"[A-Za-z][^()]*\($", head):
+                    continue                    # already inside "English (Arabic)"
                 hit = m
                 break
             if hit:
-                rendered[i] = rendered[i][:hit.end()] + f" ({en})" + rendered[i][hit.end():]
+                pre = hit.group(1)
+                new = (pre + " " if pre else "") + f"{en} ({hit.group(2)})"
+                rendered[i] = rendered[i][:hit.start()] + new + rendered[i][hit.end():]
                 seen.add(en.lower())
-                job.autotag_log.append(f"Unit {i + 1}: {ar} ({en})")
+                job.autotag_log.append(f"Unit {i + 1}: {en} ({ar})")
                 break
 
 
 def render_all(job):
+    job.unify_log = []
+    unify_terms(job)
     seen, out = set(), []
     for i, u in enumerate(job.units):
-        rendered = render_text(job.ar[i], seen, job.kind != "srt") if job.ar[i] is not None else u["en"]
+        rendered = render_text(job.ar[i], seen, ENGLISH_TERMS) if job.ar[i] is not None else u["en"]
         out.append(fix_turns(u["en"], rendered) if job.kind == "srt" else rendered)
-    if job.kind == "srt":        # video subtitles: Arabic only, no English in parentheses
-        job.autotag_log = []
-    else:
+    if ENGLISH_TERMS:
         autotag_terms(job, out, seen)
+    else:
+        job.autotag_log = []
     return out
 
 
@@ -2171,6 +2318,9 @@ def write_report(path, job, started):
              f"(revised: {sum(1 for v in job.reviewed.values() if v == 'changed')})",
              "", "== Speech-recognition corrections noted by the context pass =="]
     lines += [f"- {c.get('heard')} -> {c.get('meant')}" for c in job.brief.get("asr_corrections", [])] or ["(none)"]
+    lines += ["", f"== Mishearings found automatically by spelling similarity ({len(job.asr_auto)}) =="] \
+        + (job.asr_auto or ["(none)"])
+    lines += ["", f"== Terms unified to one Arabic rendering ({len(job.unify_log)}) =="] + (job.unify_log[:100] or ["(none)"])
     lines += ["", "== Remaining notes after review =="]
     flagged = [(u, check_unit(job, u)) for u in job.units if job.ar[u["id"] - 1] is not None]
     flagged = [(u, r) for u, r in flagged if r]
@@ -2332,6 +2482,9 @@ def main():
         print(f"  domain: {job.brief.get('domain')} | glossary terms: {len(job.gloss)} "
               f"| mishearings noted: {len(job.brief.get('asr_corrections', []))} "
               f"| keep-in-English: {len(job.brief.get('keep_english', []))}")
+        n_auto = auto_asr(job)
+        if n_auto:
+            print(f"  {n_auto} extra mishearing(s) found by spelling similarity to the glossary")
         save_progress(progress_path, job)
 
         def run_translation(label, redo_lite, on_fail_continue):
