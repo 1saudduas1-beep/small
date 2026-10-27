@@ -122,6 +122,14 @@ on:
         required: false
         default: false
         type: boolean
+      term_gloss:
+        description: 'Medical/scientific terms are always written in English; Arabic translation in parentheses: first = only at the first appearance, always = at every appearance'
+        required: false
+        default: 'first'
+        type: choice
+        options:
+          - first
+          - always
       translate_max_minutes:
         description: 'Translation time budget in minutes, 10-200 (set it higher for long audio; the step timeout follows it automatically)'
         required: false
@@ -468,6 +476,9 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TRANSLATE_FAST: ${{ github.event.inputs.fast == 'true' && 'on' || 'off' }}
+          TERM_GLOSS: ${{ github.event.inputs.term_gloss || 'first' }}
+          # YouTube links: Arabic only (no English terms); NotebookLM links: English terms + Arabic in parentheses
+          TERM_ENGLISH: ${{ env.SOURCE == 'youtube' && 'off' || 'on' }}
           # Optional extra keys (empty secrets are ignored by the script).
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
           GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
