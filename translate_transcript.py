@@ -39,6 +39,18 @@ How it works
      parentheses at their first appearance (done by the program).
   8. TIMING: every stage's duration and request count are printed and reported.
 
+v10 - COMPLETE ENGLISH TERMS
+    * NEW "term pass" (stage 6b): after review/proofreading every paragraph is re-read by a model whose
+      ONLY job is to find medical/scientific terms still written in Arabic (organs, tissues, fluids,
+      diseases, organisms, symptoms, tests, imaging, procedures, drugs, specialities...) and to give
+      their canonical English; the program wraps ALL their appearances, so each one is shown as
+      English (الترجمة العربية). Lite models that skipped the markup no longer leave Arabic-only terms.
+    * Deterministic sweep: every glossary / learned term is also wrapped wherever its Arabic still
+      appears unmarked (when the English source contains the term) - no API call.
+    * The translation prompt now lists the term categories and states that over-marking is better than
+      under-marking.
+    * TERM_PASS=off disables the term pass (the sweep always runs).
+
 v9 - SPEED + QUALITY (free tier, target <= 30 min)
     * Streaming requests with a first-token timeout that depends on the thinking level
       (low 30s / medium 60s / high 90s): a stuck request fails in seconds, not minutes.
@@ -207,7 +219,9 @@ BK_PATIENCE = 150
 BK_TIMEOUT = 100
 RETRY_PAUSE = (12, 25)       # seconds to pause between translation rounds when all models are busy
 # share of the time budget at which each stage must be finished
-STAGE_FRAC = {"context": 0.15, "context_lite": 0.25, "translate": 0.55, "lite": 0.65, "review": 0.93, "proof": 0.95}
+STAGE_FRAC = {"context": 0.15, "context_lite": 0.25, "translate": 0.55, "lite": 0.65, "review": 0.88, "proof": 0.90, "terms": 0.98}
+TERM_BATCH = 12             # paragraphs per term-pass request
+TERM_PATIENCE = 75          # seconds per term-pass request
 CONTEXT_CAP_CHARS = 150_000
 
 RETRYABLE_HTTP = {429, 500, 502, 503, 504}
@@ -1482,6 +1496,10 @@ class Job:
         self.term_log = []
         self.unify_log = []
         self.asr_auto = []
+        self.tagged = set()           # unit ids already checked by the term pass
+        self.tp_log = []              # term pass: terms added by the model
+        self.sweep_log = []           # terms added by the deterministic sweep
+        self.tp_failed = []
 
     def fingerprint(self):
         h = hashlib.sha256()
@@ -1635,10 +1653,19 @@ ENGLISH_TERMS = os.environ.get("TERM_ENGLISH", "on").strip().lower() != "off"
 _N45, _O45 = "4. Terminology: every medical or scientific name or term is shown in the final text in ENGLISH followed by its Arabic translation in parentheses, so the Arabic translation must be the standard Arabic term used in Arabic medical education (Unified Medical Dictionary / textbooks). Follow the glossary exactly and keep ONE Arabic translation per concept for the whole document. If no standard term exists, use a short descriptive Arabic phrase; for drug, organism and person names a clear Arabic transliteration is acceptable.\n5. TERM MARKUP: every time you use a glossary term, or any other medical or scientific term or name (disease, organism, sign, symptom, anatomical structure, cell, tissue, drug, test, procedure, eponym, person name, acronym), write it as ⟦arabic|English⟧. `English` is the term exactly as it must appear in the final text: the canonical English name (lowercase for common nouns; capitalised for proper names, eponyms and organism genera), using the glossary's English or the corrected spelling when it was misheard; for an acronym use the acronym, e.g. ⟦عامل فون ويلبراند|VWF⟧. `arabic` is ALWAYS the Arabic translation of that term (never Latin letters), in the standard/glossary form; put attached prefixes such as و ب ل ف outside the brackets. The program writes the English term followed by the Arabic in parentheses - do NOT write the English or any parentheses around terms yourself. Never leave a medical or scientific term as an unmarked Arabic word. Do not mark ordinary words.\n", "4. Terminology: use the standard Arabic term used in Arabic medical education (Unified Medical Dictionary / textbooks). Follow the glossary exactly and keep ONE Arabic term per concept for the whole document. If no standard term exists, use a short descriptive Arabic phrase instead of a transliteration.\n5. TERM MARKUP: every time you use a glossary term, or any other technical term (disease, sign, anatomical structure, cell, drug, test, eponym, person name, acronym), write it as ⟦arabic|English⟧. `arabic` is the exact inflected form needed in the sentence (put attached prefixes such as و ب ل ف outside the brackets); `English` is the canonical English term, using the glossary's English or the corrected spelling when it was misheard. For an acronym write the acronym as the arabic part, e.g. ⟦VWF|von Willebrand factor⟧. Do NOT write English in parentheses yourself - the program adds it on first appearance only. Do not mark ordinary words.\n"
 _N9, _O9 = '9. SUBTITLES: apart from the marked medical/scientific terms and the KEEP IN ENGLISH words, write every word in Arabic letters. Keep each cue short; the program shows each term in English and adds its Arabic translation in parentheses, so mark terms carefully and never add English yourself.', '9. ARABIC ONLY (video subtitles): write every word in Arabic letters, with no Latin letters at all and nothing kept in English. Acronyms, person names, brand names and drug names are written in Arabic transliteration as the arabic part of the markup, e.g. ⟦في دبليو إف|VWF⟧. The English part of the markup is for the program only and is never shown.'
 _NRV, _ORV = 'Keep the markup rules: every medical or scientific term stays wrapped as ⟦arabic|English⟧ where `English` is the canonical English term shown in the final text and `arabic` is its Arabic translation (never Latin letters); wrap any medical/scientific term that was left unmarked or written only in Arabic. Do not write English or parentheses around terms yourself.', 'Keep the markup rules: every technical term stays wrapped as ⟦arabic|English⟧ and no English is written in parentheses by you.'
+TERM_COVERAGE = ("TERM COVERAGE (very important): the reader must see EVERY medical or scientific term in English. Mark ALL of: "
+                 "organs and body parts (liver, diaphragm), tissues, cells, body fluids and products (sputum, bile, pus, stool), "
+                 "diseases, syndromes, symptoms and signs, organisms and their stages, parasites, drugs, tests, stains, imaging (x-ray, CT), "
+                 "procedures, anatomical or pathological descriptions (liquefied necrosis, eukaryotic), medical specialities and exams "
+                 "(parasitology, OSPE), eponyms, acronyms and units. Mark a multi-word term as ONE unit (⟦عدوى تنفسية|respiratory infection⟧). "
+                 "Mark every appearance, including repeats. When unsure whether a word is a medical/scientific term, MARK it: "
+                 "over-marking is acceptable, a missed term is not. Never write such a term as plain Arabic.")
 if not ENGLISH_TERMS:
     SYSTEM_COMMON = SYSTEM_COMMON.replace(_N45, _O45)
     _SRT_RULE9 = _O9
 else:
+    SYSTEM_COMMON = SYSTEM_COMMON.replace("Do not mark ordinary words.\n6.", "Do not mark ordinary words.\n   " + TERM_COVERAGE + "\n6.")
+    assert TERM_COVERAGE in SYSTEM_COMMON
     _SRT_RULE9 = _N9
 
 SYSTEM_TXT = SYSTEM_COMMON + """
@@ -2236,6 +2263,182 @@ def qa_pass(job):
           f"{st['failed_batches']} batch(es) failed; glossary enforced {len(job.term_log)} time(s)")
 
 
+
+# ---------------------------------------------------------------- term pass
+TERM_SYSTEM = """You are a medical/scientific terminology checker for an English-to-Arabic translation of a lecture.
+The final text must show EVERY medical or scientific term in ENGLISH, followed by its Arabic translation in parentheses. Terms already wrapped as ⟦arabic|English⟧ are done. Your ONLY job: find medical/scientific terms that are still written as plain Arabic (outside ⟦ ⟧) - or as plain English without markup - and report them.
+Report: organs and body parts, tissues, cells, body fluids/products, diseases, syndromes, symptoms, signs, organisms and parasites (and their stages), drugs, tests, stains, imaging, procedures, anatomical/pathological descriptions, medical specialities and exams, eponyms, acronyms, units of measurement of a lab value. Multi-word terms are ONE entry (the longest natural term). Do NOT report ordinary words (patient, doctor, student, exam, hospital, pressure, time) unless they are used as a technical term.
+Use the English source (it is an automatic transcript and may contain mishearings: use the corrected term) to choose the canonical English: lowercase for common nouns, capitalised for proper names, eponyms and genera, the acronym for acronyms.
+Return a JSON array of {"i": paragraph id, "ar": the term EXACTLY as written in the Arabic paragraph (copied letter by letter, WITHOUT attached prefixes و ف ب ل ك, never including text inside ⟦ ⟧), "en": canonical English term, "gloss": the standard Arabic translation of the term (Arabic letters only)}. If the term appears in the paragraph as English letters, put that English text in "ar" and still give "gloss". Report each distinct term once per paragraph (the program marks all its appearances). If a paragraph has nothing to add, return nothing for it. If nothing at all, return []."""
+
+TERM_SCHEMA = {
+    "type": "ARRAY",
+    "items": {
+        "type": "OBJECT",
+        "properties": {"i": {"type": "INTEGER"}, "ar": {"type": "STRING"}, "en": {"type": "STRING"},
+                       "gloss": {"type": "STRING"}},
+        "required": ["i", "ar", "en", "gloss"],
+        "propertyOrdering": ["i", "ar", "en", "gloss"],
+    },
+}
+
+
+def _wrap_unmarked(raw, phrase, make):
+    """Wrap every occurrence of `phrase` found OUTSIDE ⟦ ⟧ and outside (...) ; make(prefix) -> replacement.
+    Returns (new_raw, count)."""
+    latin = bool(LATIN_RE.search(phrase)) and not ARABIC_RE.search(phrase)
+    if latin:
+        pat = re.compile(r"(?<![A-Za-z])()(" + re.escape(phrase) + r")(?![A-Za-z])", re.I)
+    else:
+        pat = re.compile(r"(?<![؀-ۿ])([وفبلك]?)(" + re.escape(phrase) + r")(?![؀-ۿ])")
+    parts = re.split(r"(⟦[^⟧]*⟧)", raw)
+    n = 0
+    for k in range(0, len(parts), 2):
+        def sub(m):
+            nonlocal n
+            n += 1
+            return m.group(1) + make()
+        parts[k] = pat.sub(sub, parts[k])
+    return "".join(parts), n
+
+
+def apply_term(job, i, ar, en, gloss, log):
+    raw = job.ar[i - 1]
+    if not raw:
+        return False
+    ar, en, gloss = (ar or "").strip(), (en or "").strip(), (gloss or "").strip()
+    if not ar or not en or any(c in ar + en + gloss for c in "⟦⟧|"):
+        return False
+    if not LATIN_RE.search(en) or ARABIC_RE.search(en) or len(en) > 70 or len(ar.split()) > 6:
+        return False
+    if en.lower() in keep_words(job):
+        return False
+    ar_is_latin = bool(LATIN_RE.search(ar)) and not ARABIC_RE.search(ar)
+    if ar_is_latin:
+        disp = gloss
+    else:
+        if LATIN_RE.search(ar) or not ARABIC_RE.search(ar):
+            return False
+        disp = ar
+    if not ARABIC_RE.search(disp) or LATIN_RE.search(disp):
+        return False
+    std = job.gloss.get(en.lower(), ("", ""))[1].strip()
+    if std and ARABIC_RE.search(std) and not _same_term(disp, std) and not ar_is_latin:
+        disp = disp                                   # inflection kept; unify_terms aligns the rendering later
+    new, n = _wrap_unmarked(raw, ar, lambda: f"⟦{disp}|{en}⟧")
+    if n == 0:
+        return False
+    job.ar[i - 1] = new
+    log.append(f"Unit {i}: {en} ({disp}) x{n}")
+    return True
+
+
+def _term_worker(job, chain, level, batch):
+    items = json.dumps([{"i": u["id"], "en": u["en"], "ar": job.ar[u["id"] - 1]} for u in batch], ensure_ascii=False)
+    prompt = (f"{brief_text(job)}\n\nGLOSSARY (canonical English = Arabic):\n{glossary_text(job)}\n\n"
+              f"KNOWN TRANSCRIPT MISHEARINGS (heard -> meant):\n{corrections_text(job)}\n\n"
+              f"KEEP IN ENGLISH (never report):\n{keep_text(job)}\n\n"
+              f"CHECK these {len(batch)} paragraphs:\nITEMS:\n{items}")
+    last = None
+    for _ in range(2):
+        try:
+            text, model = call_gemini(chain, TERM_SYSTEM, prompt, TERM_SCHEMA, level=level,
+                                      patience=TERM_PATIENCE, rounds=1)
+            res = clean_json(text)
+            if isinstance(res, dict):
+                res = res.get("items") or res.get("terms") or []
+            if not isinstance(res, list):
+                raise ValueError("response is not a list")
+            return res, model
+        except ApiUnavailable as e:
+            if e.fatal:
+                raise
+            last = e
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"failed twice: {str(last)[:140]}")
+
+
+def term_done(job, batch, ok, val):
+    ids = [u["id"] for u in batch]
+    if not ok:
+        job.tp_failed.append(f"{ids[0]}-{ids[-1]}: {str(val)[:100]}")
+        print(f"  term pass batch {ids[0]}-{ids[-1]} skipped: {str(val)[:100]}")
+        return
+    res, _model = val
+    job.tagged.update(ids)
+    for c in res:
+        if isinstance(c, dict) and isinstance(c.get("i"), int) and c["i"] in ids:
+            if apply_term(job, c["i"], c.get("ar"), c.get("en"), c.get("gloss"), job.tp_log):
+                job.learn_terms(job.ar[c["i"] - 1])
+
+
+def sweep_known_terms(job):
+    """No API call: glossary / learned terms whose Arabic is still unmarked are wrapped, provided the
+    English source of that paragraph contains the term."""
+    job.sweep_log = []
+    with job.lock:
+        pairs = list(job.gloss.values())
+    entries = []
+    for en, ar in pairs:
+        ar = ar.strip()
+        if not (LATIN_RE.search(en) and ARABIC_RE.search(ar) and not LATIN_RE.search(ar)):
+            continue
+        if len(ar) < 3 or len(en.split()) > 4 or en.lower() in keep_words(job):
+            continue
+        w0 = re.findall(r"[A-Za-z]{3,}", en)
+        if not w0:
+            continue
+        stem = w0[0][:max(4, len(w0[0]) - 3)].lower()
+        entries.append((en, ar, re.compile(r"(?<![A-Za-z])" + re.escape(stem), re.I)))
+    entries.sort(key=lambda t: -len(t[1]))               # longest Arabic phrase first
+    for en, ar, stem_re in entries:
+        for i, u in enumerate(job.units):
+            raw = job.ar[i]
+            if not raw or job.kept_en[i] or not stem_re.search(u["en"]):
+                continue
+            forms = {ar}
+            if ar.startswith("ال"):
+                forms.add(ar[2:])
+            else:
+                forms.add("ال" + ar)
+            for f in sorted(forms, key=len, reverse=True):
+                new, n = _wrap_unmarked(raw, f, lambda f=f: f"⟦{ar}|{en}⟧")
+                if n:
+                    raw = new
+                    job.sweep_log.append(f"Unit {i + 1}: {en} ({ar}) x{n}")
+            job.ar[i] = raw
+
+
+def term_pass(job):
+    """Find medical/scientific terms still written in Arabic and mark them (English first, Arabic in brackets)."""
+    if not ENGLISH_TERMS:
+        return
+    if os.environ.get("TERM_PASS", "on").strip().lower() in ("off", "none", "0"):
+        print("Term pass disabled (the deterministic sweep still runs).")
+    else:
+        todo = [u for u in job.units if job.ar[u["id"] - 1] and not job.kept_en[u["id"] - 1]
+                and u["id"] not in job.tagged]
+        batches = [todo[k:k + TERM_BATCH] for k in range(0, len(todo), TERM_BATCH)]
+        if batches:
+            chain = build_chain(job.primary)
+            lvl = get_thinking_level()
+            print(f"Term pass: {len(batches)} request(s) over {len(todo)} paragraph(s).")
+
+            def work(b):
+                return _term_worker(job, chain, lvl, b)
+
+            try:
+                run_parallel(work, batches, min(PARALLEL[0], len(batches)),
+                             lambda b, ok, val: term_done(job, b, ok, val))
+            except ApiUnavailable as e:
+                job.tp_failed.append(f"stopped: {str(e)[:100]}")
+                print(f"  term pass stopped: {str(e)[:100]} (the sweep still runs)")
+    sweep_known_terms(job)
+    print(f"  term pass added {len(job.tp_log)} term(s); sweep added {len(job.sweep_log)}"
+          + (f"; {len(job.tp_failed)} batch(es) not checked" if job.tp_failed else ""))
+
+
 # ---------------------------------------------------------------- output
 def autotag_terms(job, rendered, seen):
     """Glossary terms never marked by the model: the Arabic term becomes 'English (Arabic)' at its
@@ -2304,6 +2507,7 @@ _STAGE_EN = {
     "review": "Review",
     "quality pass": "Quality pass (review + proofreading merged)",
     "proofreading": "Proofreading",
+    "term pass": "Term pass (Arabic terms -> English)",
 }
 
 
@@ -2332,6 +2536,12 @@ def write_report(path, job, started):
     lines += ["", "== Proofreading ==",
               f"Corrections applied: {job.proof_stats['applied']} | rejected: {job.proof_stats['rejected']} "
               f"| failed batches: {job.proof_stats['failed_batches']}"] + job.proof_log[:300]
+    lines += ["", f"== Term pass: Arabic-only terms converted to English (model): {len(job.tp_log)} =="] \
+        + (job.tp_log[:300] or ["(none)"])
+    if job.tp_failed:
+        lines += ["Batches NOT checked by the term pass: " + "; ".join(job.tp_failed[:10])]
+    lines += ["", f"== Term sweep (glossary terms found unmarked): {len(job.sweep_log)} =="] \
+        + (job.sweep_log[:300] or ["(none)"])
     lines += ["", f"== Terms tagged automatically (English added by the program): {len(job.autotag_log)} =="] \
         + (job.autotag_log or ["(none)"])
     lines += ["", f"== Glossary enforced by the program: {len(job.term_log)} change(s) =="] \
@@ -2369,7 +2579,7 @@ def save_progress(path, job):
             "core": sorted(job.core), "ar": list(job.ar), "deg": list(job.deg), "gem": list(job.gem),
             "model": list(job.model),
             "kept_en": list(job.kept_en), "reviewed": {str(k): v for k, v in job.reviewed.items()},
-            "proofed": sorted(job.proofed),
+            "proofed": sorted(job.proofed), "tagged": sorted(job.tagged),
         }
     with SAVE_LOCK:                       # parallel workers save too: serialize, never share a temp file
         tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
@@ -2400,6 +2610,8 @@ def load_progress(path, job):
         job.carry = {k for k, g in enumerate(job.gem) if g}
         job.reviewed = {int(k): v for k, v in data.get("reviewed", {}).items()}
         job.proofed = set(data.get("proofed", []))
+        job.tagged = {i for i in data.get("tagged", []) if 0 < i <= len(job.units)
+                      and job.ar[i - 1] and not job.deg[i - 1] and not job.gem[i - 1] and not job.kept_en[i - 1]}
         done = sum(1 for a in job.ar if a is not None)
         print(f"Resuming from checkpoint: {done}/{len(job.units)} units already translated.")
         return True
@@ -2552,11 +2764,128 @@ def main():
         with Stage("quality pass"):
             set_stage_end("review")
             qa_pass(job)
+
+        with Stage("term pass"):
+            set_stage_end("terms")
+            try:
+                term_pass(job)
+            except StageTimeUp:
+                print("  term pass ran out of time (the sweep still runs)")
+                sweep_known_terms(job)
+        save_progress(progress_path, job)
     except ApiUnavailable as e:
         done = sum(1 for a in job.ar if a is not None)
         print(f"ERROR: {e}")
         save_progress(progress_path, job)
         p = f"{prefix}_ar_partial{ext}"
+        try:
+            sweep_known_terms(job)
+        except Exception:
+            pass
+        write_output(p, job, render_all(job), bilingual=False)
+        write_report(f"{prefix}_report.txt", job, started)
+        print(f"Saved partial result ({done}/{len(units)} units translated, rest kept in English): {p}")
+        print(f"Checkpoint saved: {progress_path} (commit it to the repo root to resume without repeating work)")
+        sys.exit(1)
+
+    rendered = render_all(job)
+    print(f"Auto-tagged {len(job.autotag_log)} term(s) that the model had not marked.")
+    if mode in ("arabic", "both"):
+        p = f"{prefix}_ar{ext}"
+        write_output(p, job, rendered, bilingual=False)
+        print(f"Wrote {p}")
+    if mode in ("bilingual", "both"):
+        p = f"{prefix}_bilingual{ext}"
+        write_output(p, job, rendered, bilingual=True)
+        print(f"Wrote {p}")
+    write_report(f"{prefix}_report.txt", job, started)
+    print(f"Wrote {prefix}_report.txt")
+    incomplete = any(a is None for a in job.ar) or any(job.deg) or any(job.gem) or any(job.kept_en)
+    if incomplete:
+
+        def run_translation(label, redo_lite, on_fail_continue):
+            rnd = 0
+            while True:
+                chunks = plan_chunks(job, redo_lite=redo_lite)
+                if not chunks:
+                    return
+                if time.time() >= STAGE_END[0]:
+                    print(f"  {label}: stage time is up with {sum(len(c) for c in chunks)} unit(s) pending")
+                    return
+                if not job.lite_ok and not chain_alive(build_chain(model)):
+                    print("  every quality model has used its daily quota on every key "
+                          "(free-tier quotas reset at midnight Pacific time) -> stopping this stage")
+                    return
+                rnd += 1
+                items = list(enumerate(chunks, 1))
+                print(f"{label} round {rnd}: {len(items)} batch(es), {sum(len(c) for c in chunks)} unit(s) pending")
+
+                def tr(item):
+                    n, chunk = item
+                    print(f"Translating batch {n}/{len(items)} (units {chunk[0]['id']}-{chunk[-1]['id']} "
+                          f"/ {len(units)})...")
+                    translate_batch(job, chunk)
+
+                def tr_done(item, ok, val):
+                    if ok:
+                        save_progress(progress_path, job)
+                        return
+                    if isinstance(val, StageTimeUp):
+                        return
+                    if isinstance(val, ApiUnavailable) and not val.fatal:
+                        print(f"  batch {item[0]} not finished: {str(val)[:100]}")
+                        save_progress(progress_path, job)
+                        return
+                    raise val
+
+                run_parallel(tr, items, min(PARALLEL[0], len(items)), tr_done)
+                if not plan_chunks(job, redo_lite=redo_lite) or on_fail_continue:
+                    return
+                left = STAGE_END[0] - time.time()
+                if left <= 1:
+                    continue
+                wait = min(random.uniform(*RETRY_PAUSE), left)
+                print(f"  quality models are busy; pausing {wait:.0f}s, then retrying the unfinished batches")
+                with LOCK:
+                    PAUSE_UNTIL[0] = max(PAUSE_UNTIL[0], time.time() + wait)
+                try:
+                    _wait_pause(STAGE_END[0], force=True)
+                except ApiUnavailable:
+                    pass
+
+        with Stage("translation (quality models only)"):
+            set_stage_end("translate")
+            run_translation("Translation", True, False)
+
+        if plan_chunks(job, redo_lite=False):
+            with Stage("translation (lite last resort)"):
+                set_stage_end("lite")
+                job.lite_ok = True
+                QUALITY_FAILS[0] = 2
+                run_translation("Last-resort", False, True)
+            job.lite_ok = False
+
+        with Stage("quality pass"):
+            set_stage_end("review")
+            qa_pass(job)
+
+        with Stage("term pass"):
+            set_stage_end("terms")
+            try:
+                term_pass(job)
+            except StageTimeUp:
+                print("  term pass ran out of time (the sweep still runs)")
+                sweep_known_terms(job)
+        save_progress(progress_path, job)
+    except ApiUnavailable as e:
+        done = sum(1 for a in job.ar if a is not None)
+        print(f"ERROR: {e}")
+        save_progress(progress_path, job)
+        p = f"{prefix}_ar_partial{ext}"
+        try:
+            sweep_known_terms(job)
+        except Exception:
+            pass
         write_output(p, job, render_all(job), bilingual=False)
         write_report(f"{prefix}_report.txt", job, started)
         print(f"Saved partial result ({done}/{len(units)} units translated, rest kept in English): {p}")
