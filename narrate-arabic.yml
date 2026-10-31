@@ -1,0 +1,223 @@
+name: Narrate Arabic
+
+# Place this file at .github/workflows/narrate-arabic.yml. narrate_arabic.py lives at the repository root.
+#
+# Turns the Arabic translation (*_ar.txt / *_ar.srt) made by the "Transcribe Audio" workflow into ONE
+# narrated audio file (MP3) with Gemini 3.8 Flash-Lite TTS, single narrator, free tier.
+#
+# Input (choose one):
+#   * source_run_id: the number in the URL of the finished "Transcribe Audio" run
+#     (…/actions/runs/<NUMBER>) + source_artifact (the output name of that run, default "transcript");
+#     the *_ar.txt (or *_ar.srt) inside it is used.
+#   * input_file: a path inside the repository (used when source_run_id is empty).
+#
+# Free tier: about 10 requests per day per key and 3 per minute. When the daily quota ends, the finished
+# part is saved (cache + *_partial* files); run again with the SAME input after midnight Pacific time and only
+# the missing chunks are narrated. Secrets: GEMINI_API_KEY (GEMINI_API_KEY_2 ... _5 optional, each from a
+# DIFFERENT Google Cloud project: the free quota is per project).
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: 'Run number of the finished "Transcribe Audio" run (leave empty to use input_file)'
+        required: false
+        default: ''
+        type: string
+      source_artifact:
+        description: 'Artifact name of that run (= its output file name, default transcript)'
+        required: false
+        default: 'transcript'
+        type: string
+      input_file:
+        description: 'Path of the Arabic .txt / .srt inside the repository (used when no run number is given)'
+        required: false
+        default: 'narrate_input/transcript_ar.txt'
+        type: string
+      base_name:
+        description: 'Output file base name (Arabic letters are kept)'
+        required: false
+        default: 'narration'
+        type: string
+      voice:
+        description: 'Narrator voice (prebuilt voice name, e.g. Charon, Kore, Orus, Sulafat, Gacrux)'
+        required: false
+        default: 'Charon'
+        type: string
+      chunk_chars:
+        description: 'Characters per request (800-7000). Larger = fewer requests per day, but longer audio per request'
+        required: false
+        default: '4500'
+        type: string
+      gloss:
+        description: 'English term followed by its Arabic gloss: ay = spoken as "term، أي gloss" | comma | skip = gloss not spoken'
+        required: false
+        default: 'ay'
+        type: choice
+        options:
+          - ay
+          - comma
+          - skip
+      plan_only:
+        description: 'Only show the plan (chunks, requests, days) and the spoken script; no API call, no quota used'
+        required: false
+        default: false
+        type: boolean
+      also_wav:
+        description: 'Also save the full WAV (large file)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  narrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      SOURCE_RUN_ID: ${{ github.event.inputs.source_run_id }}
+      SOURCE_ARTIFACT: ${{ github.event.inputs.source_artifact }}
+      INPUT_FILE: ${{ github.event.inputs.input_file }}
+      BASE_NAME: ${{ github.event.inputs.base_name }}
+      NARRATE_VOICE: ${{ github.event.inputs.voice }}
+      NARRATE_CHUNK_CHARS: ${{ github.event.inputs.chunk_chars }}
+      NARRATE_GLOSS: ${{ github.event.inputs.gloss }}
+      NARRATE_WAV: ${{ github.event.inputs.also_wav == 'true' && 'on' || 'off' }}
+      NARRATE_WORKDIR: narration_work
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Normalize inputs
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          raw = os.environ.get("BASE_NAME", "")
+          name = "".join(c if (c.isalnum() or c == "-") else "_" for c in raw.strip())
+          name = re.sub(r"_+", "_", name).strip("_-")[:80].strip("_-") or "narration"
+          rid = os.environ.get("SOURCE_RUN_ID", "").strip()
+          if rid and not rid.isdigit():
+              print("::error::source_run_id must be a number (the digits in the run URL).")
+              sys.exit(1)
+          art = os.environ.get("SOURCE_ARTIFACT", "").strip() or "transcript"
+          if not re.fullmatch(r"[\w.\-\u0600-\u06FF ]+", art):
+              print("::error::source_artifact contains unsupported characters.")
+              sys.exit(1)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"SAFE_NAME={name}\nSRC_ARTIFACT={art}\n")
+          print(f"Output file base name: {name}")
+          PY
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate secrets
+        if: ${{ github.event.inputs.plan_only != 'true' }}
+        env:
+          HAS_KEY: ${{ secrets.GEMINI_API_KEY != '' }}
+        run: |
+          if [[ "$HAS_KEY" != "true" ]]; then
+            echo "::error::The GEMINI_API_KEY repository secret is not set."
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Make sure ffmpeg is installed
+        timeout-minutes: 10
+        run: |
+          if command -v ffmpeg >/dev/null; then ffmpeg -version | head -n1; exit 0; fi
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get -o Acquire::Retries=3 update -qq
+          sudo apt-get -o Acquire::Retries=3 install -y -qq --no-install-recommends ffmpeg
+
+      # Source 1: the artifact of a finished transcription run.
+      - name: Download the Arabic text from the transcription run
+        if: ${{ github.event.inputs.source_run_id != '' }}
+        run: |
+          rm -rf narrate_source && mkdir narrate_source
+          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" -n "$SRC_ARTIFACT" -D narrate_source
+          F="$(find narrate_source -type f -name '*_ar.txt' | sort | head -n1)"
+          [[ -z "$F" ]] && F="$(find narrate_source -type f -name '*_ar.srt' | sort | head -n1)"
+          if [[ -z "$F" ]]; then
+            echo "::error::No *_ar.txt / *_ar.srt found in artifact '$SRC_ARTIFACT' of run $SOURCE_RUN_ID (was translation_output arabic or both?)."
+            find narrate_source -type f
+            exit 1
+          fi
+          echo "Using $F"
+          echo "NARRATE_INPUT=$F" >> "$GITHUB_ENV"
+
+      # Source 2: a file in the repository.
+      - name: Use the input file from the repository
+        if: ${{ github.event.inputs.source_run_id == '' }}
+        run: |
+          if [[ ! -s "$INPUT_FILE" ]]; then
+            echo "::error::input_file '$INPUT_FILE' does not exist in the repository (or is empty)."
+            exit 1
+          fi
+          echo "NARRATE_INPUT=$INPUT_FILE" >> "$GITHUB_ENV"
+
+      # The cache key depends on the TEXT only, so a re-run of the same text (any day) reuses finished chunks.
+      - name: Compute cache key
+        run: |
+          echo "NCACHE=narrate-$(sha1sum "$NARRATE_INPUT" | cut -c1-16)-$(printf '%s|%s' "$NARRATE_VOICE" "$NARRATE_CHUNK_CHARS" | sha1sum | cut -c1-8)" >> "$GITHUB_ENV"
+
+      - name: Restore finished audio chunks
+        if: ${{ github.event.inputs.plan_only != 'true' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: narration_work
+          key: ${{ env.NCACHE }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ env.NCACHE }}-
+
+      - name: Narrate with Gemini TTS
+        id: narrate
+        timeout-minutes: 150
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
+          GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
+          GEMINI_API_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
+          NARRATE_MAX_MINUTES: '140'
+          # NARRATE_MODEL: gemini-3.8-flash-lite-tts
+          # NARRATE_STYLE: calm, clear and authoritative educational narration in Modern Standard Arabic
+          # NARRATE_MP3_KBPS: '96'
+        run: |
+          mkdir -p out
+          ARGS=()
+          [[ "${{ github.event.inputs.plan_only }}" == "true" ]] && ARGS+=(--plan)
+          set +e
+          python narrate_arabic.py "$NARRATE_INPUT" "out/$SAFE_NAME" "${ARGS[@]}"
+          RC=$?
+          set -e
+          if [[ $RC -eq 2 ]]; then
+            echo "::warning::Narration is INCOMPLETE (daily quota / time). Run again with the SAME input after midnight Pacific time; finished chunks are reused. The finished part is in the artifact as *_partial*."
+            echo "### Narration incomplete - re-run with the same input after the quota reset." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          exit $RC
+
+      - name: Save finished audio chunks
+        if: ${{ always() && !cancelled() && github.event.inputs.plan_only != 'true' && hashFiles('narration_work/*.wav') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: narration_work
+          key: ${{ env.NCACHE }}-${{ github.run_id }}
+
+      - name: Upload narration artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SAFE_NAME }}_narration
+          path: |
+            out/${{ env.SAFE_NAME }}_narration*
+          if-no-files-found: warn
+          retention-days: 14
