@@ -15,8 +15,8 @@ Pipeline
               tatweel / markup / quotes removed, % spoken, every paragraph ends with punctuation.
               English terms stay in Latin letters so the narrator pronounces them in English.
   3. CHUNK    paragraph/sentence boundaries, <= NARRATE_CHUNK_CHARS characters per request.
-  4. SYNTH    one request per chunk, rate-limited per key (RPM), keys rotated, per-day 429 marks a key as
-              exhausted. Every finished chunk is saved to disk at once (resume = run again).
+  4. SYNTH    one request per chunk; one worker per API key runs in parallel (each key respects its own RPM),
+              a per-day 429 retires that key and its chunk goes back to the queue. Every finished chunk is saved to disk at once (resume = run again).
               Truncated / too-short audio is detected and the chunk is split in two and redone.
   5. ASSEMBLE chunks + pauses -> WAV -> MP3 (loudness-normalised) + chapters + report + spoken script.
               If the quota ends early, the finished leading part is written as *_partial* and exit code is 2.
@@ -34,6 +34,7 @@ Environment
     NARRATE_WAV           off (default) | on   (also write the full WAV)
     NARRATE_MP3_KBPS      default 96
     NARRATE_WORKDIR       default narration_work
+    NARRATE_WORKERS       parallel workers, one key each (default 0 = one per key; 1 = sequential)
     GEMINI_API_BASE       override the API base (tests)
 
 Exit codes: 0 complete | 2 incomplete (quota / time / chunk failure; partial output written) | 1 fatal.
@@ -51,6 +52,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -99,8 +101,14 @@ class BadResponse(Exception):
     pass
 
 
+_LOG_LOCK = threading.Lock()
+
+
 def log(msg):
-    print(msg, flush=True)
+    name = threading.current_thread().name
+    prefix = f"[{name}] " if name.startswith("key") else ""
+    with _LOG_LOCK:
+        print(prefix + msg, flush=True)
 
 
 def env_num(name, default, cast=float):
@@ -124,6 +132,7 @@ class Cfg:
         self.wav = os.environ.get("NARRATE_WAV", "off").strip().lower() in ("on", "1", "true", "yes")
         self.kbps = max(32, env_num("NARRATE_MP3_KBPS", 96, int))
         self.workdir = os.environ.get("NARRATE_WORKDIR", "narration_work").strip() or "narration_work"
+        self.workers = max(0, env_num("NARRATE_WORKERS", 0, int))   # 0 = one worker per key
 
 
 def load_keys():
@@ -577,20 +586,92 @@ def main():
         print("ERROR: no Gemini API key found (set GEMINI_API_KEY as a GitHub secret).", file=sys.stderr)
         return 1
 
-    api = Api(keys, cfg)
-    run = Run(cfg, api)
-    done, stop = [], None
     started = time.time()
-    try:
-        for n, text in enumerate(chunks, 1):
-            log(f"Chunk {n}/{len(chunks)} ({len(text)} chars)")
-            done.append((text, run.resolve(text)))
-    except (QuotaExhausted, TimeUp, ChunkFailed) as e:
-        stop = str(e)
-        log(f"STOPPED at chunk {len(done) + 1}/{len(chunks)}: {stop}")
-    except Fatal as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+    n_workers = min(len(keys), cfg.workers or len(keys), 8)
+    log(f"Workers: {n_workers} in parallel (one API key each)")
+    queue = list(range(len(chunks)))
+    results, failures, stops, fatals = {}, {}, [], []
+    lock, halt = threading.Lock(), threading.Event()
+    workers = []
+
+    def work(ki, api, run):
+        while not halt.is_set():
+            with lock:
+                if not queue:
+                    return
+                n = queue.pop(0)
+            log(f"Chunk {n + 1}/{len(chunks)} ({len(chunks[n])} chars)")
+            try:
+                ks = run.resolve(chunks[n])
+                with lock:
+                    results[n] = ks
+            except (QuotaExhausted, TimeUp) as e:
+                with lock:
+                    queue.insert(0, n)
+                    queue.sort()
+                    stops.append(str(e))
+                log(f"worker stopped: {e}")
+                return
+            except ChunkFailed as e:
+                with lock:
+                    failures[n] = str(e)
+                log(f"chunk {n + 1} failed: {e}")
+            except Fatal as e:
+                with lock:
+                    fatals.append(str(e))
+                halt.set()
+                return
+            except Exception as e:  # unexpected: do not lose the other workers' progress
+                with lock:
+                    failures[n] = repr(e)[:200]
+                log(f"chunk {n + 1} unexpected error: {e!r}")
+
+    threads = []
+    for w, ki in enumerate(range(n_workers)):
+        api = Api([keys[ki]], cfg)
+        run = Run(cfg, api)
+        workers.append((ki, api, run))
+        th = threading.Thread(target=work, args=(ki, api, run), name=f"key{ki + 1}", daemon=True)
+        threads.append(th)
+        th.start()
+        time.sleep(0.2)
+    for th in threads:
+        th.join()
+    if fatals:
+        print(f"ERROR: {fatals[0]}", file=sys.stderr)
         return 1
+
+    class Agg:
+        pass
+
+    agg = Agg()
+    agg.send_style = all(a.send_style for _, a, _ in workers)
+    agg.used, agg.errs = Counter(), Counter()
+    agg.bad, agg.exhausted, agg.quirks, agg.flags = set(), set(), [], []
+    agg.fresh = agg.splits = 0
+    agg.waited = 0.0
+    for ki, a, r in workers:
+        agg.used[ki] += sum(a.used.values())
+        agg.errs.update(a.errs)
+        agg.bad |= {ki for _ in a.bad}
+        agg.exhausted |= {ki for _ in a.exhausted}
+        agg.quirks += [q for q in a.quirks if q not in agg.quirks]
+        agg.flags += r.flags
+        agg.fresh += r.fresh
+        agg.splits += r.splits
+        agg.waited += a.waited
+    reader = Run(cfg, None)
+    agg.read_pcm = reader.read_pcm
+    api = run = agg
+
+    done, n = [], 0
+    while n in results:          # only the contiguous leading part can be assembled into one file
+        done.append((chunks[n], results[n]))
+        n += 1
+    stop = None
+    if len(done) < len(chunks):
+        stop = (failures.get(n) and f"chunk {n + 1} failed: {failures[n]}") or (stops[0] if stops else "chunks missing")
+        log(f"STOPPED: {len(done)}/{len(chunks)} leading chunks ready ({len(results)} chunks narrated in total): {stop}")
 
     complete = stop is None
     pcm, chapters, t = [silence(PAUSE_START)], [], PAUSE_START
