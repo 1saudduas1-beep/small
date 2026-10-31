@@ -8,6 +8,14 @@ name: Transcribe Audio
 # v9 (free tier, <= 30 min): streaming + short first-token timeouts, per-model circuit
 # breaker, hedged requests while congested, merged review+proofreading pass, enforced glossary.
 # Tip: 503 peaks roughly 9:00-18:00 Pacific time; running outside those hours is faster.
+# clean_audio=auto skips Demucs for NotebookLM links (no music there) and keeps it for YouTube.
+# Narration (optional, narrate ticked): after a COMPLETE translation, narrate_arabic.py (repository root)
+# turns the Arabic text into one MP3 with Gemini 3.8 Flash-Lite TTS (free tier: ~10 requests/day per key).
+# Narration runs one worker per API key in parallel (N keys = about N times faster).
+# It reuses the same GEMINI_API_KEY ... _5 secrets, is uploaded as a separate artifact "<name>_narration",
+# and finished audio chunks are cached (key = hash of the translated text), so after a quota stop just run
+# the SAME link again with reuse_previous (and narrate) ticked. The separate workflow narrate-arabic.yml
+# still works on its own.
 # Optional secrets: MISTRAL_API_KEY, GROQ_API_KEY (backup providers, free keys), GEMINI_API_KEY (translation; GEMINI_API_KEY_2 ... _5 are
 # optional extra keys that are rotated automatically - create each one in a
 # DIFFERENT Google Cloud project, free-tier quotas are per project, not per key),
@@ -87,10 +95,14 @@ on:
           - gemini-3.6-flash
           - gemini-3-flash-preview
       clean_audio:
-        description: 'srt only: isolate the voice from music / songs / noise (Demucs) before transcribing. Slower (about the video length) but far better with background music'
+        description: 'srt only: isolate the voice from music / songs / noise (Demucs) before transcribing. Slower (about the audio length). auto = on for YouTube links, off for NotebookLM links (speech only, saves a lot of time)'
         required: false
-        default: true
-        type: boolean
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - 'on'
+          - 'off'
       speakers:
         description: 'srt only: detect different speakers; a cue with two speakers is written as two lines, each starting with a dash (-)'
         required: false
@@ -135,6 +147,16 @@ on:
         required: false
         default: '30'
         type: string
+      narrate:
+        description: 'تحويل الترجمة العربية إلى ملف صوتي MP3 (Gemini TTS, free tier) after a complete translation - needs translate ticked'
+        required: false
+        default: false
+        type: boolean
+      narration_voice:
+        description: 'Narrator voice for narrate (e.g. Charon, Kore, Orus, Sulafat, Gacrux)'
+        required: false
+        default: 'Charon'
+        type: string
 
 # Least privilege: this workflow only needs to read the repository.
 permissions:
@@ -143,7 +165,7 @@ permissions:
 jobs:
   transcribe:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 360
 
     # Untrusted inputs are passed through environment variables and only ever
     # referenced as quoted shell variables ("$VAR"), never expanded inline with
@@ -157,9 +179,9 @@ jobs:
       GEMINI_MODEL: ${{ github.event.inputs.gemini_model }}
       SAVE_VIDEO: ${{ github.event.inputs.save_video == 'true' || github.event.inputs.video_only == 'true' }}
       VIDEO_ONLY: ${{ github.event.inputs.video_only == 'true' }}
-      CLEAN_AUDIO: ${{ github.event.inputs.clean_audio }}
       SPEAKERS: ${{ github.event.inputs.speakers == 'true' && 'on' || 'off' }}
       VIDEO_QUALITY: ${{ github.event.inputs.video_quality }}
+      NARRATE_VOICE: ${{ github.event.inputs.narration_voice }}
 
     steps:
       # Normalize free-form inputs. Any file name is accepted: it is cleaned
@@ -194,8 +216,20 @@ jobs:
       - name: Validate inputs
         env:
           TRANSLATE: ${{ github.event.inputs.translate }}
+          NARRATE: ${{ github.event.inputs.narrate }}
+          CLEAN_AUDIO_MODE: ${{ github.event.inputs.clean_audio }}
           HAS_GEMINI_KEY: ${{ secrets.GEMINI_API_KEY != '' }}
         run: |
+          if [[ "$NARRATE" == "true" ]]; then
+            if [[ "$VIDEO_ONLY" == "true" || "$TRANSLATE" != "true" ]]; then
+              echo "::error::narrate needs translate ticked and video_only unticked (the narration reads the Arabic translation)."
+              exit 1
+            fi
+            if [[ ! "$NARRATE_VOICE" =~ ^[A-Za-z0-9_-]{0,60}$ ]]; then
+              echo "::error::narration_voice may only contain letters, digits, - and _ (example: Charon)."
+              exit 1
+            fi
+          fi
           YT_RE='^https://(((www|m|music)\.)?youtube\.com|youtu\.be)/'
           NLM_RE='^https://([A-Za-z0-9-]+\.)+google(\.com)?([/?#]|$)'
           if [[ "$CLEAN_URL" =~ $YT_RE ]]; then
@@ -216,6 +250,13 @@ jobs:
           fi
           echo "Audio source: $SOURCE"
           echo "SOURCE=$SOURCE" >> "$GITHUB_ENV"
+          case "$CLEAN_AUDIO_MODE" in
+            on|true) CA=true ;;
+            off|false) CA=false ;;
+            *) if [[ "$SOURCE" == "youtube" ]]; then CA=true; else CA=false; fi ;;
+          esac
+          echo "CLEAN_AUDIO=$CA" >> "$GITHUB_ENV"
+          echo "Voice isolation (Demucs): $CA (mode: ${CLEAN_AUDIO_MODE:-auto})"
           KEY="$(printf '%s' "$CLEAN_URL" | sha1sum | cut -c1-16)"
           echo "FMT=$OUTPUT_FORMAT" >> "$GITHUB_ENV"
           if [[ "$VIDEO_ONLY" == "true" ]]; then
@@ -546,6 +587,98 @@ jobs:
             echo "::warning::$N paragraph(s) are untranslated or came from a lite/Gemma model and were not reviewed. Run this workflow again with the SAME link after the Gemini daily quota resets (midnight Pacific time); only those paragraphs are redone."
             echo "### Translation incomplete: $N paragraph(s) pending - re-run with the same link after the quota reset." >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      # ------------------------------------------------ optional: narration
+      # Only after a successful and COMPLETE translation: untranslated paragraphs would otherwise be
+      # skipped silently and burn the daily TTS quota on an unfinished text.
+      - name: Check the translation before narrating
+        id: ngate
+        if: ${{ success() && github.event.inputs.narrate == 'true' && github.event.inputs.translate == 'true' && env.VIDEO_ONLY != 'true' && env.SAFE_NAME != '' }}
+        run: |
+          F=""
+          for C in "${SAFE_NAME}_ar.${FMT}" "${SAFE_NAME}_bilingual.${FMT}"; do
+            if [[ -s "$C" ]]; then F="$C"; break; fi
+          done
+          if [[ -z "$F" ]]; then
+            echo "::warning::No translated file found - narration skipped."
+            exit 0
+          fi
+          REPORT="${SAFE_NAME}_report.txt"
+          N=0
+          [[ -f "$REPORT" ]] && N="$(grep -oP '== Units to redo on the next run[^:]*: \K[0-9]+' "$REPORT" || echo 0)"
+          if [[ "${N:-0}" -gt 0 ]]; then
+            echo "::warning::Narration skipped: $N paragraph(s) of the translation are still pending. Re-run with the SAME link (reuse_previous + narrate ticked) after the Gemini quota resets; narration starts once the translation is complete."
+            echo "### Narration skipped: translation incomplete ($N paragraph(s) pending)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          K="narrate-$(sha1sum "$F" | cut -c1-16)-$(printf '%s|4500' "$NARRATE_VOICE" | sha1sum | cut -c1-8)"
+          echo "Narrating: $F"
+          {
+            echo "input=$F"
+            echo "key=$K"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Make sure ffmpeg is installed (narration)
+        if: ${{ steps.ngate.outputs.input != '' }}
+        timeout-minutes: 10
+        run: |
+          if command -v ffmpeg >/dev/null; then ffmpeg -version | head -n1; exit 0; fi
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get -o Acquire::Retries=3 update -qq
+          sudo apt-get -o Acquire::Retries=3 install -y -qq --no-install-recommends ffmpeg
+
+      - name: Restore finished narration chunks
+        if: ${{ steps.ngate.outputs.input != '' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: narration_work
+          key: ${{ steps.ngate.outputs.key }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ steps.ngate.outputs.key }}-
+
+      - name: Narrate with Gemini TTS
+        if: ${{ steps.ngate.outputs.input != '' }}
+        timeout-minutes: 90
+        env:
+          NARRATE_INPUT: ${{ steps.ngate.outputs.input }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
+          GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
+          GEMINI_API_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
+          NARRATE_WORKDIR: narration_work
+          NARRATE_MAX_MINUTES: '80'
+          # NARRATE_MODEL: gemini-3.8-flash-lite-tts
+          # NARRATE_CHUNK_CHARS: '4500'
+          # NARRATE_MP3_KBPS: '96'
+        run: |
+          mkdir -p narration_out
+          set +e
+          python narrate_arabic.py "$NARRATE_INPUT" "narration_out/$SAFE_NAME"
+          RC=$?
+          set -e
+          if [[ $RC -eq 2 ]]; then
+            echo "::warning::Narration is INCOMPLETE (daily TTS quota / time). Re-run with the SAME link (reuse_previous + narrate ticked) after midnight Pacific time; finished chunks are reused. The finished part is in the artifact as *_partial*."
+            echo "### Narration incomplete - re-run with the same link after the quota reset." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          exit $RC
+
+      - name: Save finished narration chunks
+        if: ${{ always() && !cancelled() && steps.ngate.outputs.input != '' && hashFiles('narration_work/*.wav') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: narration_work
+          key: ${{ steps.ngate.outputs.key }}-${{ github.run_id }}
+
+      - name: Upload narration artifact
+        if: ${{ !cancelled() && steps.ngate.outputs.input != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SAFE_NAME }}_narration
+          path: narration_out/${{ env.SAFE_NAME }}_narration*
+          if-no-files-found: warn
+          retention-days: 14
 
       # Runs even if an earlier step failed, so the Whisper transcript, any
       # partial translation and the extraction screenshot (debug_extract.png,
