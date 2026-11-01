@@ -129,6 +129,11 @@ on:
           - '480'
           - '720'
           - '1080'
+      video_start:
+        description: 'Start point (empty = from the beginning): a plain number = minutes (30 = minute 30), or 30:00, 1:05:30, 90s. Applies to the saved video AND to the transcription + translation (everything before it is skipped; subtitle times start at 0 from this point)'
+        required: false
+        default: ''
+        type: string
       fast:
         description: 'أسرع (Faster): use Lite models only (Gemini Flash-Lite) for every translation stage; no Flash, Gemma or backup models. Lower quality, much larger daily quota'
         required: false
@@ -181,6 +186,7 @@ jobs:
       VIDEO_ONLY: ${{ github.event.inputs.video_only == 'true' }}
       SPEAKERS: ${{ github.event.inputs.speakers == 'true' && 'on' || 'off' }}
       VIDEO_QUALITY: ${{ github.event.inputs.video_quality }}
+      VIDEO_START: ${{ github.event.inputs.video_start }}
       NARRATE_VOICE: ${{ github.event.inputs.narration_voice }}
 
     steps:
@@ -248,6 +254,11 @@ jobs:
             echo "::error::Translation is enabled but the GEMINI_API_KEY repository secret is not set."
             exit 1
           fi
+          VS="${VIDEO_START// /}"
+          if [[ -n "$VS" ]] && ! [[ "$VS" =~ ^[0-9]+(\.[0-9]+)?$ || "$VS" =~ ^[0-9]+:[0-5]?[0-9](:[0-5]?[0-9])?$ || "$VS" =~ ^([0-9]+h)?([0-9]+m)?([0-9]+s)?$ ]]; then
+            echo "::error::video_start must look like 30 (minutes), 30:00, 1:05:30 or 90s."
+            exit 1
+          fi
           echo "Audio source: $SOURCE"
           echo "SOURCE=$SOURCE" >> "$GITHUB_ENV"
           case "$CLEAN_AUDIO_MODE" in
@@ -257,7 +268,8 @@ jobs:
           esac
           echo "CLEAN_AUDIO=$CA" >> "$GITHUB_ENV"
           echo "Voice isolation (Demucs): $CA (mode: ${CLEAN_AUDIO_MODE:-auto})"
-          KEY="$(printf '%s' "$CLEAN_URL" | sha1sum | cut -c1-16)"
+          # The resume cache is per link AND start point (a different start = a different transcript).
+          KEY="$(printf '%s|%s' "$CLEAN_URL" "${VS}" | sha1sum | cut -c1-16)"
           echo "FMT=$OUTPUT_FORMAT" >> "$GITHUB_ENV"
           if [[ "$VIDEO_ONLY" == "true" ]]; then
             # Video only: no audio download, transcription, translation or resume cache.
@@ -456,6 +468,22 @@ jobs:
           if ! awk -v d="$DUR" 'BEGIN { exit !(d + 0 > 0) }'; then
             echo "::error::The downloaded file has no readable audio duration."
             exit 1
+          fi
+
+      # Optional: keep only the audio from video_start to the end (so transcription + translation start there).
+      - name: Trim audio from video_start
+        if: ${{ env.HAVE_TRANSCRIPT != 'true' && env.VIDEO_START != '' }}
+        run: |
+          SECS="$(python3 -c "import sys; sys.path.insert(0,'.'); from download_youtube_video import parse_start; print(parse_start(sys.argv[1]))" "${VIDEO_START// /}")"
+          if awk -v s="$SECS" 'BEGIN { exit !(s + 0 > 0) }'; then
+            ffmpeg -v error -y -ss "$SECS" -i "$AUDIO_FILE" -vn -ac 1 -ar 16000 trimmed_audio.wav
+            DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 trimmed_audio.wav || true)
+            if ! awk -v d="$DUR" 'BEGIN { exit !(d + 0 > 1) }'; then
+              echo "::error::video_start ($SECS s) is beyond the end of the audio."
+              exit 1
+            fi
+            echo "AUDIO_FILE=trimmed_audio.wav" >> "$GITHUB_ENV"
+            echo "Audio trimmed: starts at ${SECS}s, remaining ${DUR}s"
           fi
 
       # srt only. Isolates the voice (Demucs "vocals" stem) so music, songs and noise do
@@ -696,7 +724,7 @@ jobs:
           YOUTUBE_MAX_MINUTES: '240'
           YOUTUBE_VIDEO_MAX_MB: '1500'
         run: |
-          python download_youtube_video.py "$CLEAN_URL" video_download "$RUNNER_TEMP/video_file.txt" "${VIDEO_QUALITY:-240}"
+          python download_youtube_video.py "$CLEAN_URL" video_download "$RUNNER_TEMP/video_file.txt" "${VIDEO_QUALITY:-240}" "${VIDEO_START// /}"
           NAME="$(cat "$RUNNER_TEMP/video_file.txt")"
           if [[ "$NAME" != "video_download.mp4" ]]; then
             echo "::error::Unexpected video file name from the downloader."
