@@ -22,8 +22,8 @@ Pipeline
               If the quota ends early, the finished leading part is written as *_partial* and exit code is 2.
 
 Environment
-    GEMINI_API_KEY, GEMINI_API_KEY_2 ... _8, GEMINI_API_KEYS   (create each key in a DIFFERENT Google
-                          Cloud project: the free quota is per project)
+    GEMINI_API_KEY, GEMINI_API_KEY_2 ... _<any number>, GEMINI_API_KEYS   (create each key in a DIFFERENT
+                          Google Cloud project: the free quota is per project)
     NARRATE_MODEL         default gemini-3.8-flash-lite-tts
     NARRATE_VOICE         default Charon (a prebuilt voice name, or a designed voice id voice_...)
     NARRATE_STYLE         narration style sent as speech_metadata.style (never spoken); empty = none
@@ -136,8 +136,15 @@ class Cfg:
 
 
 def load_keys():
-    names = ["GEMINI_API_KEY"] + [f"GEMINI_API_KEY_{i}" for i in range(2, 9)]
-    vals = [os.environ.get(n, "").strip() for n in names]
+    """Collects every Gemini key from the environment: GEMINI_API_KEY, GEMINI_API_KEY_<n> (any n, in numeric
+    order) and GEMINI_API_KEYS (comma list). Only variables with these names are read."""
+    pat = re.compile(r"^GEMINI_API_KEY(?:_(\d+))?$", re.I)
+    found = {}
+    for n, v in os.environ.items():
+        m = pat.match(n)
+        if m and v.strip():
+            found.setdefault(int(m.group(1) or 1), v.strip())
+    vals = [found[i] for i in sorted(found)]
     vals += [v.strip() for v in os.environ.get("GEMINI_API_KEYS", "").split(",")]
     out = []
     for v in vals:
@@ -587,7 +594,7 @@ def main():
         return 1
 
     started = time.time()
-    n_workers = min(len(keys), cfg.workers or len(keys), 8)
+    n_workers = min(len(keys), cfg.workers or len(keys), 64)
     log(f"Workers: {n_workers} in parallel (one API key each)")
     queue = list(range(len(chunks)))
     results, failures, stops, fatals = {}, {}, [], []
