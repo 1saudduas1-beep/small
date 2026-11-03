@@ -226,7 +226,7 @@ jobs:
           RC=$?
           set -e
           if [[ $RC -eq 2 ]]; then
-            echo "::warning::Narration is INCOMPLETE (daily quota / time). Run again with the SAME input after midnight Pacific time; finished chunks are reused. The finished part is in the artifact as *_partial*."
+            echo "::warning::Narration is INCOMPLETE (daily quota / time). Run again with the SAME input after midnight Pacific time; finished chunks are reused. The finished part is in the audio artifact as *_partial.mp3."
             echo "### Narration incomplete - re-run with the same input after the quota reset." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
@@ -239,12 +239,39 @@ jobs:
           path: narration_work
           key: ${{ env.NCACHE }}-${{ github.run_id }}
 
-      - name: Upload narration artifact
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "### Narration output"
+            echo '```'
+            ls -lh out 2>/dev/null || echo "(no files)"
+            echo '```'
+            echo "Audio is in the artifact **${SAFE_NAME}_audio** (MP3 only); reports are in **${SAFE_NAME}_reports**."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The audio goes alone in its own artifact (stored, not compressed: MP3 does not shrink), so it can be
+      # downloaded without the reports. The web page extracts the MP3 from the ZIP and saves it as a plain file.
+      - name: Upload audio artifact
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.SAFE_NAME }}_narration
+          name: ${{ env.SAFE_NAME }}_audio
           path: |
-            out/${{ env.SAFE_NAME }}_narration*
-          if-no-files-found: warn
+            out/${{ env.SAFE_NAME }}.mp3
+            out/${{ env.SAFE_NAME }}.wav
+            out/${{ env.SAFE_NAME }}_partial.mp3
+            out/${{ env.SAFE_NAME }}_partial.wav
+          compression-level: 0
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload reports artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SAFE_NAME }}_reports
+          path: |
+            out/${{ env.SAFE_NAME }}_narration*.txt
+          if-no-files-found: ignore
           retention-days: 14
