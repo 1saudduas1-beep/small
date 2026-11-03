@@ -537,7 +537,7 @@ class Run:
 
 def encode(prefix, wav_path, cfg, partial):
     suffix = "_partial" if partial else ""
-    mp3 = f"{prefix}_narration{suffix}.mp3"
+    mp3 = f"{prefix}{suffix}.mp3"
     if not shutil.which("ffmpeg"):
         log("WARNING: ffmpeg not found - MP3 skipped, WAV kept.")
         return None
@@ -693,7 +693,7 @@ def main():
     if done:
         data = b"".join(pcm)
         suffix = "" if complete else "_partial"
-        wav_path = f"{prefix}_narration{suffix}.wav"
+        wav_path = f"{prefix}{suffix}.wav"
         with open(wav_path, "wb") as f:
             f.write(make_wav(data))
         mp3 = encode(prefix, wav_path, cfg, not complete)
