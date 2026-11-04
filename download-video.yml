@@ -1,0 +1,185 @@
+name: Download YouTube Video
+
+# Place this file at .github/workflows/download-video.yml in the repository.
+# Standalone workflow: downloads ONE YouTube video (.mp4) - no transcription, no translation.
+# Needs at the repository root: download_youtube_video.py + download_youtube_audio.py
+# (the same scripts used by transcribe-2.yml).
+# Optional secrets: YOUTUBE_COOKIES / YOUTUBE_COOKIES_B64 (same as the transcription workflow;
+# usually needed because YouTube blocks GitHub's datacenter IPs).
+# The video is uploaded UNZIPPED as its own artifact, so it plays directly on a phone.
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'YouTube video link (youtube.com / youtu.be)'
+        required: true
+        type: string
+      base_name:
+        description: 'Output file base name (optional; cleaned automatically, Arabic letters are kept)'
+        required: false
+        default: 'video'
+        type: string
+      video_quality:
+        description: 'Max video height (lower = smaller file)'
+        required: false
+        default: '240'
+        type: choice
+        options:
+          - '144'
+          - '240'
+          - '360'
+          - '480'
+          - '720'
+          - '1080'
+      video_start:
+        description: 'Start point (empty = from the beginning): a plain number = minutes (30 = minute 30), or 30:00, 1:05:30, 90s. Everything from there to the end is downloaded'
+        required: false
+        default: ''
+        type: string
+      max_minutes:
+        description: 'Refuse videos longer than this many minutes (10-600)'
+        required: false
+        default: '240'
+        type: string
+      max_mb:
+        description: 'Refuse files larger than this many MB (50-5000)'
+        required: false
+        default: '1500'
+        type: string
+      retention_days:
+        description: 'Days the video stays downloadable (1-90)'
+        required: false
+        default: '14'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    # Untrusted inputs go through environment variables and are only used as quoted shell variables.
+    env:
+      VIDEO_URL: ${{ github.event.inputs.video_url }}
+      BASE_NAME: ${{ github.event.inputs.base_name }}
+      VIDEO_QUALITY: ${{ github.event.inputs.video_quality }}
+      VIDEO_START: ${{ github.event.inputs.video_start }}
+      MAX_MINUTES: ${{ github.event.inputs.max_minutes }}
+      MAX_MB: ${{ github.event.inputs.max_mb }}
+      RETENTION: ${{ github.event.inputs.retention_days }}
+
+    steps:
+      - name: Validate and normalize inputs
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+          url = os.environ.get("VIDEO_URL", "").strip()
+          if not url or re.search(r"\s", url):
+              fail("video_url must be a single link without spaces inside it.")
+          if not re.match(r"^https://(((www|m|music)\.)?youtube\.com|youtu\.be)/", url):
+              fail("video_url must be an https youtube.com / youtu.be video link.")
+
+          raw = os.environ.get("BASE_NAME", "")
+          name = "".join(c if (c.isalnum() or c == "-") else "_" for c in raw.strip())
+          name = re.sub(r"_+", "_", name).strip("_-")[:80].strip("_-") or "video"
+
+          vs = os.environ.get("VIDEO_START", "").replace(" ", "")
+          if vs and not (
+              re.fullmatch(r"[0-9]+(\.[0-9]+)?", vs)
+              or re.fullmatch(r"[0-9]+:[0-5]?[0-9](:[0-5]?[0-9])?", vs)
+              or re.fullmatch(r"([0-9]+h)?([0-9]+m)?([0-9]+s)?", vs)
+          ):
+              fail("video_start must look like 30 (minutes), 30:00, 1:05:30 or 90s.")
+
+          def num(var, lo, hi, default):
+              v = (os.environ.get(var) or default).strip()
+              if not re.fullmatch(r"[0-9]+", v) or not (lo <= int(v) <= hi):
+                  fail(f"{var.lower()} must be a whole number between {lo} and {hi}.")
+              return v
+
+          mm = num("MAX_MINUTES", 10, 600, "240")
+          mb = num("MAX_MB", 50, 5000, "1500")
+          rd = num("RETENTION", 1, 90, "14")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"SAFE_NAME={name}\nCLEAN_URL={url}\nSTART_CLEAN={vs}\n"
+                      f"MAX_MIN={mm}\nMAX_MBYTES={mb}\nRETENTION_DAYS={rd}\n")
+          if name != raw:
+              print(f"::notice::Output file base name: {name} (adjusted to a safe file name)")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write(f"### Video: `{name}.mp4` - up to {os.environ.get('VIDEO_QUALITY','240')}p"
+                      + (f", from `{vs}`" if vs else "") + "\n")
+          PY
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ffmpeg is normally preinstalled on ubuntu-latest; install only if missing.
+      - name: Make sure ffmpeg is installed
+        timeout-minutes: 12
+        run: |
+          if command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null; then
+            echo "ffmpeg is already installed."; exit 0
+          fi
+          export DEBIAN_FRONTEND=noninteractive
+          APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Dpkg::Lock::Timeout=60"
+          for i in 1 2 3; do
+            if timeout -k 10 60 sudo apt-get $APT update -qq \
+               && timeout -k 10 150 sudo apt-get $APT install -y -qq --no-install-recommends ffmpeg; then
+              exit 0
+            fi
+            echo "::warning::apt attempt $i failed or hung; retrying..."
+            sudo dpkg --configure -a || true
+            sleep 5
+          done
+          echo "::error::Could not install ffmpeg after 3 attempts."
+          exit 1
+
+      # YouTube breaks older yt-dlp builds quickly, so always take the latest.
+      - name: Install yt-dlp and Deno
+        run: |
+          pip install -U "yt-dlp[default]"
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
+          "$HOME/.deno/bin/deno" --version
+          yt-dlp --version
+
+      - name: Download video from YouTube
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+          YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
+          YOUTUBE_MAX_MINUTES: ${{ env.MAX_MIN }}
+          YOUTUBE_VIDEO_MAX_MB: ${{ env.MAX_MBYTES }}
+        run: |
+          python download_youtube_video.py "$CLEAN_URL" video_download "$RUNNER_TEMP/video_file.txt" "${VIDEO_QUALITY:-240}" "$START_CLEAN"
+          NAME="$(cat "$RUNNER_TEMP/video_file.txt")"
+          if [[ "$NAME" != "video_download.mp4" ]]; then
+            echo "::error::Unexpected video file name from the downloader."
+            exit 1
+          fi
+          mkdir -p video_out
+          mv "$NAME" "video_out/${SAFE_NAME}.mp4"
+          ls -lh "video_out/${SAFE_NAME}.mp4"
+          SIZE_MB=$(( $(stat -c %s "video_out/${SAFE_NAME}.mp4") / 1048576 ))
+          echo "Size: ${SIZE_MB} MB" >> "$GITHUB_STEP_SUMMARY"
+
+      # Uploaded UNZIPPED as its own artifact so it can be opened/played directly on a phone.
+      - name: Upload video artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: video_out/${{ env.SAFE_NAME }}.mp4
+          archive: false
+          if-no-files-found: error
+          retention-days: ${{ env.RETENTION_DAYS }}
