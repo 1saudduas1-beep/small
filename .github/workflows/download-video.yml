@@ -16,9 +16,9 @@ on:
         required: true
         type: string
       base_name:
-        description: 'Output file base name (optional; cleaned automatically, Arabic letters are kept)'
+        description: 'Output file base name (optional). Empty = the original video title + (quality), e.g. "My Video (240p)"'
         required: false
-        default: 'video'
+        default: ''
         type: string
       video_quality:
         description: 'Max video height (lower = smaller file)'
@@ -87,8 +87,10 @@ jobs:
               fail("video_url must be an https youtube.com / youtu.be video link.")
 
           raw = os.environ.get("BASE_NAME", "")
+          # Typed name -> used as is (cleaned). Empty -> resolved later from the video title.
           name = "".join(c if (c.isalnum() or c == "-") else "_" for c in raw.strip())
-          name = re.sub(r"_+", "_", name).strip("_-")[:80].strip("_-") or "video"
+          name = re.sub(r"_+", "_", name).strip("_-")[:80].strip("_-")
+          auto = "0" if name else "1"
 
           vs = os.environ.get("VIDEO_START", "").replace(" ", "")
           if vs and not (
@@ -109,13 +111,10 @@ jobs:
           rd = num("RETENTION", 1, 90, "14")
 
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
-              f.write(f"SAFE_NAME={name}\nCLEAN_URL={url}\nSTART_CLEAN={vs}\n"
+              f.write(f"SAFE_NAME={name}\nNAME_AUTO={auto}\nCLEAN_URL={url}\nSTART_CLEAN={vs}\n"
                       f"MAX_MIN={mm}\nMAX_MBYTES={mb}\nRETENTION_DAYS={rd}\n")
-          if name != raw:
+          if name and name != raw.strip():
               print(f"::notice::Output file base name: {name} (adjusted to a safe file name)")
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
-              f.write(f"### Video: `{name}.mp4` - up to {os.environ.get('VIDEO_QUALITY','240')}p"
-                      + (f", from `{vs}`" if vs else "") + "\n")
           PY
 
       - name: Checkout repository
@@ -156,6 +155,47 @@ jobs:
           "$HOME/.deno/bin/deno" --version
           yt-dlp --version
 
+      # Default name = original video title + (quality). Best effort: falls back to the video id.
+      - name: Resolve output name from the video title
+        if: ${{ env.NAME_AUTO == '1' }}
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+          YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          import download_youtube_audio as base
+
+          q = os.environ.get("VIDEO_QUALITY", "240")
+          title, vid = "", "video"
+          cookie_path = None
+          try:
+              vid, clean = base.normalize_youtube_url(os.environ["CLEAN_URL"])
+              cookie_path = base.write_cookie_file(base.load_cookie_text())
+              import yt_dlp
+              opts = {"quiet": True, "noplaylist": True, "skip_download": True, "socket_timeout": 30}
+              if cookie_path:
+                  opts["cookiefile"] = cookie_path
+              with yt_dlp.YoutubeDL(opts) as ydl:
+                  title = str(ydl.extract_info(clean, download=False).get("title") or "")
+          except Exception as e:
+              print(f"::warning::Could not read the video title ({type(e).__name__}); using the video id.")
+          finally:
+              if cookie_path:
+                  try:
+                      os.remove(cookie_path)
+                  except OSError:
+                      pass
+
+          t = "".join(c if (c.isalnum() or c in " -") else "_" for c in title)
+          t = re.sub(r"_+", "_", t)
+          t = re.sub(r"\s+", " ", t).strip(" _-")[:100].strip(" _-") or str(vid) or "video"
+          name = f"{t} ({q}p)"
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"SAFE_NAME={name}\n")
+          print(f"Output file: {name}.mp4")
+          PY
+
       - name: Download video from YouTube
         env:
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
@@ -173,13 +213,16 @@ jobs:
           mv "$NAME" "video_out/${SAFE_NAME}.mp4"
           ls -lh "video_out/${SAFE_NAME}.mp4"
           SIZE_MB=$(( $(stat -c %s "video_out/${SAFE_NAME}.mp4") / 1048576 ))
-          echo "Size: ${SIZE_MB} MB" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Video: \`${SAFE_NAME}.mp4\` - up to ${VIDEO_QUALITY:-240}p${START_CLEAN:+, from \`$START_CLEAN\`}"
+            echo "Size: ${SIZE_MB} MB"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # Uploaded UNZIPPED as its own artifact so it can be opened/played directly on a phone.
       - name: Upload video artifact
         uses: actions/upload-artifact@v7
         with:
-          path: video_out/${{ env.SAFE_NAME }}.mp4
+          path: video_out/*.mp4
           archive: false
           if-no-files-found: error
           retention-days: ${{ env.RETENTION_DAYS }}
